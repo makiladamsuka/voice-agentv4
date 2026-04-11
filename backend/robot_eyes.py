@@ -1741,14 +1741,14 @@ try:
         right_eye.target_pos[1] = left_eye.target_pos[1]
         
         # 3. Blink Logic
-        # If talking, force earlier blinks!
-        if udp_speak_pulse > 0.0 and (next_blink_time - time.time()) > 2.5:
-             next_blink_time = time.time() + random.uniform(0.2, 1.5)
+        # If talking, force earlier blinks but don't overdo it!
+        if udp_speak_pulse > 0.0 and (next_blink_time - time.time()) > 4.5:
+             next_blink_time = time.time() + random.uniform(1.0, 2.5)
         if time.time() > next_blink_time:
             blink_speed = random.uniform(BLINK_SPEED_MIN, BLINK_SPEED_MAX)
             trigger_synced_blink(blink_speed)
             last_blink_time = time.time()
-            next_blink_time = time.time() + random.uniform(1.2 if udp_speak_pulse > 0.0 else 3.5, 3.5 if udp_speak_pulse > 0.0 else 7.0)
+            next_blink_time = time.time() + random.uniform(2.5 if udp_speak_pulse > 0.0 else 3.5, 5.0 if udp_speak_pulse > 0.0 else 7.0)
 
         # 4. Conversational Micro-Expressions (darting eyes while speaking)
         if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and not gaze_event_active:
