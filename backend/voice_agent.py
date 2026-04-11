@@ -72,18 +72,22 @@ async def entrypoint(ctx: agents.JobContext):
     # regardless of which SDK version you are running!
     @session.on("agent_speech_started")
     def on_speech_started(*args, **kwargs):
+        print("🔊 [LiveKit] Agent started speaking! (Sending bounce pulse -> Eyes)")
         send_pulse(1.0)
         
     @session.on("agent_started_speaking")
     def on_started_speaking(*args, **kwargs):
+        print("🔊 [LiveKit] Agent started speaking! (Sending bounce pulse -> Eyes)")
         send_pulse(1.0)
 
     @session.on("agent_speech_stopped")
     def on_speech_stopped(*args, **kwargs):
+        print("🔇 [LiveKit] Agent stopped speaking! (Stopping bounce pulse)")
         send_pulse(0.0)
         
     @session.on("agent_stopped_speaking")
     def on_stopped_speaking(*args, **kwargs):
+        print("🔇 [LiveKit] Agent stopped speaking! (Stopping bounce pulse)")
         send_pulse(0.0)
         
     # Keeps session alive
