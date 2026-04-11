@@ -25,7 +25,7 @@ chromadb
 
 # Display and Servo hardware drivers
 adafruit-circuitpython-rgb-display
-adafruit-servokit
+adafruit-circuitpython-servokit
 luma.oled
 luma.lcd
 
