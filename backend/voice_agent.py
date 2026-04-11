@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from tools import TimeTools, SearchTools, EmotionTools
+from tools import TimeTools, SearchTools
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
 from livekit.plugins import openai, deepgram, silero
 import os
@@ -20,7 +20,7 @@ def prewarm(proc: agents.JobProcess):
         prefix_padding_duration=0.2
     )
 
-class SimpleVoiceAgent(Agent, TimeTools, SearchTools, EmotionTools):
+class SimpleVoiceAgent(Agent, TimeTools, SearchTools):
     def __init__(self):
         from prompt import SYSTEM_INSTRUCTIONS
         super().__init__(
@@ -59,13 +59,64 @@ async def entrypoint(ctx: agents.JobContext):
     # --- UDP Pulse Bridge ---
     import socket
     import json
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    analyzer = SentimentIntensityAnalyzer()
     
     def send_pulse(power: float):
         try:
             payload = json.dumps({"speak_pulse": power}).encode("utf-8")
             sock.sendto(payload, ("127.0.0.1", 9000))
         except:
+            pass
+
+    def analyze_and_send_emotion(text: str):
+        if not text or not text.strip(): return
+        
+        # We don't want to analyze single filler words
+        if len(text.split()) < 2: return
+        
+        scores = analyzer.polarity_scores(text)
+        comp = scores['compound']
+        
+        emotion = "neutral"
+        if comp > 0.6: emotion = "happy"
+        elif comp > 0.2: emotion = "warm"
+        elif comp < -0.6: emotion = "angry"
+        elif comp < -0.2: emotion = "sad"
+        else: emotion = "engaged" # default thinking state while talking
+
+        try:
+            payload = json.dumps({"command": "emotion", "emotion": emotion}).encode("utf-8")
+            sock.sendto(payload, ("127.0.0.1", 9000))
+            print(f"🤖 [Vader] Evaluated Agent Thought: '{text[:40]}...' -> Score: {comp:.2f} -> Eye Emotion: {emotion}")
+        except:
+            pass
+
+    # Try to hook the generated text before it's spoken
+    @session.on("agent_speech_committed")
+    def on_agent_speech_committed(msg):
+        try:
+            # Different SDK versions wrap this differently
+            text = str(msg)
+            if hasattr(msg, "content"): text = msg.content
+            elif hasattr(msg, "text"): text = msg.text
+            elif isinstance(msg, dict) and "content" in msg: text = msg["content"]
+            analyze_and_send_emotion(text)
+        except Exception as e:
+            print("Vader Error:", e)
+
+    # Note: We also evaluate what the USER says to pre-react with emotion!
+    @session.on("user_speech_committed")
+    def on_user_speech_committed(msg):
+        try:
+            text = str(msg)
+            if hasattr(msg, "content"): text = msg.content
+            elif hasattr(msg, "text"): text = msg.text
+            elif isinstance(msg, dict) and "content" in msg: text = msg["content"]
+            analyze_and_send_emotion(text)
+        except Exception as e:
             pass
 
     # Hook into raw WebRTC room events to detect when the local agent is outputting audio
