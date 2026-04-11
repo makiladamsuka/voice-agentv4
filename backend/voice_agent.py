@@ -68,27 +68,22 @@ async def entrypoint(ctx: agents.JobContext):
         except:
             pass
 
-    # Bind to every possible LiveKit speaking event name to ensure it fires
-    # regardless of which SDK version you are running!
-    @session.on("agent_speech_started")
-    def on_speech_started(*args, **kwargs):
-        print("🔊 [LiveKit] Agent started speaking! (Sending bounce pulse -> Eyes)")
-        send_pulse(1.0)
-        
-    @session.on("agent_started_speaking")
-    def on_started_speaking(*args, **kwargs):
-        print("🔊 [LiveKit] Agent started speaking! (Sending bounce pulse -> Eyes)")
-        send_pulse(1.0)
-
-    @session.on("agent_speech_stopped")
-    def on_speech_stopped(*args, **kwargs):
-        print("🔇 [LiveKit] Agent stopped speaking! (Stopping bounce pulse)")
-        send_pulse(0.0)
-        
-    @session.on("agent_stopped_speaking")
-    def on_stopped_speaking(*args, **kwargs):
-        print("🔇 [LiveKit] Agent stopped speaking! (Stopping bounce pulse)")
-        send_pulse(0.0)
+    # Hook into raw WebRTC room events to detect when the local agent is outputting audio
+    @ctx.room.on("active_speakers_changed")
+    def on_speakers_changed(speakers):
+        # Check if the agent (local participant) is currently producing audio
+        speaking = False
+        for p in speakers:
+            if p.sid == ctx.room.local_participant.sid:
+                speaking = True
+                break
+                
+        if speaking:
+            print("🔊 [Audio Matrix] Agent is actively speaking -> BOUNCE !")
+            send_pulse(1.0)
+        else:
+            print("🔇 [Audio Matrix] Agent is silent -> STOP BOUNCE")
+            send_pulse(0.0)
         
     # Keeps session alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
