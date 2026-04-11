@@ -1751,18 +1751,18 @@ try:
             next_blink_time = time.time() + random.uniform(1.2 if udp_speak_pulse > 0.0 else 3.5, 3.5 if udp_speak_pulse > 0.0 else 7.0)
 
         # 4. Conversational Micro-Expressions (darting eyes while speaking)
-        if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and can_avert:
+        if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and not gaze_event_active:
             # Dart randomly to emphasize speech
             sx = random.choice([-1.0, 1.0])
             start_gaze_event(
                 "AVERT_TALK",
-                sx * random.uniform(10.0, 35.0),
-                random.uniform(-25.0, 20.0),
-                to_sec=random.uniform(0.1, 0.25),
-                hold_sec=random.uniform(0.2, 0.8),
-                back_sec=random.uniform(0.15, 0.3)
+                sx * random.uniform(15.0, 45.0),
+                random.uniform(-30.0, 25.0),
+                to_sec=random.uniform(0.08, 0.20),
+                hold_sec=random.uniform(0.2, 0.6),
+                back_sec=random.uniform(0.10, 0.25)
             )
-            next_talk_saccade_ts = now + random.uniform(0.8, 2.8)
+            next_talk_saccade_ts = now + random.uniform(0.4, 1.4)
 
         # Keep idle motion deterministic to avoid perceived micro-jitter.
         
