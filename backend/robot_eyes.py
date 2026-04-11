@@ -979,6 +979,7 @@ gaze_override_y = 0.0
 scan_emotion_override = None
 no_face_scan_completed_pulse = False
 gaze_reengage_until = 0.0
+next_talk_saccade_ts = 0.0
 gaze_next_allowed_ts = time.time()
 gaze_next_scan_ts = time.time() + random.uniform(GAZE_AMBIENT_SCAN_MIN_SEC, GAZE_AMBIENT_SCAN_MAX_SEC)
 gaze_next_release_ts = time.time() + random.uniform(GAZE_SOCIAL_RELEASE_MIN_SEC, GAZE_SOCIAL_RELEASE_MAX_SEC)
@@ -1740,11 +1741,29 @@ try:
         right_eye.target_pos[1] = left_eye.target_pos[1]
         
         # 3. Blink Logic
+        # If talking, force earlier blinks!
+        if udp_speak_pulse > 0.0 and (next_blink_time - time.time()) > 2.5:
+             next_blink_time = time.time() + random.uniform(0.2, 1.5)
         if time.time() > next_blink_time:
             blink_speed = random.uniform(BLINK_SPEED_MIN, BLINK_SPEED_MAX)
             trigger_synced_blink(blink_speed)
             last_blink_time = time.time()
-            next_blink_time = time.time() + random.uniform(3.5, 7.0)
+            next_blink_time = time.time() + random.uniform(1.2 if udp_speak_pulse > 0.0 else 3.5, 3.5 if udp_speak_pulse > 0.0 else 7.0)
+
+        # 4. Conversational Micro-Expressions (darting eyes while speaking)
+        global next_talk_saccade_ts
+        if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and can_avert:
+            # Dart randomly to emphasize speech
+            sx = random.choice([-1.0, 1.0])
+            start_gaze_event(
+                "AVERT_TALK",
+                sx * random.uniform(10.0, 35.0),
+                random.uniform(-25.0, 20.0),
+                to_sec=random.uniform(0.1, 0.25),
+                hold_sec=random.uniform(0.2, 0.8),
+                back_sec=random.uniform(0.15, 0.3)
+            )
+            next_talk_saccade_ts = now + random.uniform(0.8, 2.8)
 
         # Keep idle motion deterministic to avoid perceived micro-jitter.
         
@@ -1757,19 +1776,10 @@ try:
             left_eye.target_scale_w += reengage_bump
             left_eye.target_scale_h += reengage_bump * 0.70
             
-        # Give the eyes a static shape shift (taller, slightly raised) when the agent talks
-        speak_bump = 0.0
-        if udp_speak_pulse > 0.0:
-            speak_bump = 0.20 # 20% taller
-            left_eye.target_scale_h += speak_bump
-            left_eye.target_pos[1] -= 25.0
         left_eye.update()
         if reengage_bump > 0.0:
             left_eye.target_scale_w -= reengage_bump
             left_eye.target_scale_h -= reengage_bump * 0.70
-        if speak_bump > 0.0:
-            left_eye.target_scale_h -= speak_bump
-            left_eye.target_pos[1] += 25.0
         mirror_full_state(left_eye, right_eye)
         
         # 6. Draw
