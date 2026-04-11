@@ -1229,7 +1229,7 @@ def udp_worker():
 def vision_worker():
     global running, target_x_off, target_y_off, target_rotation, target_squint
     global target_face_present, target_face_area_ratio, target_face_count
-    global squint_until, latest_frame, servo_target_pan, servo_target_tilt, last_face_seen_ts
+    global squint_until, latest_frame, servo_target_pan, servo_target_tilt, last_face_seen_ts, next_talk_saccade_ts
 
     interval = 1.0 / max(1.0, float(VISION_FPS))
     next_tick = time.perf_counter()
@@ -1751,7 +1751,6 @@ try:
             next_blink_time = time.time() + random.uniform(1.2 if udp_speak_pulse > 0.0 else 3.5, 3.5 if udp_speak_pulse > 0.0 else 7.0)
 
         # 4. Conversational Micro-Expressions (darting eyes while speaking)
-        global next_talk_saccade_ts
         if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and can_avert:
             # Dart randomly to emphasize speech
             sx = random.choice([-1.0, 1.0])
