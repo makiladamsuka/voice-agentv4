@@ -90,7 +90,7 @@ BLINK_SPEED_MAX = 4.2
 LOOK_SIDE_OFFSET = 16.0
 
 # Debug Mode - set to True to see emotion transitions
-DEBUG_EMOTIONS = True
+DEBUG_EMOTIONS = False
 
 # Distance-based behavior
 CLOSE_FACE_ENTER_RATIO = 0.05
