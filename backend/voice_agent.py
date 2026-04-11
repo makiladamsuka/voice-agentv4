@@ -56,7 +56,37 @@ async def entrypoint(ctx: agents.JobContext):
     
     await session.say("Hello! I am your voice assistant. How can I help you today?")
     
-    # Keep session alive
+    # --- UDP Pulse Bridge ---
+    import socket
+    import json
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    
+    def send_pulse(power: float):
+        try:
+            payload = json.dumps({"speak_pulse": power}).encode("utf-8")
+            sock.sendto(payload, ("127.0.0.1", 9000))
+        except:
+            pass
+
+    # Bind to every possible LiveKit speaking event name to ensure it fires
+    # regardless of which SDK version you are running!
+    @session.on("agent_speech_started")
+    def on_speech_started(*args, **kwargs):
+        send_pulse(1.0)
+        
+    @session.on("agent_started_speaking")
+    def on_started_speaking(*args, **kwargs):
+        send_pulse(1.0)
+
+    @session.on("agent_speech_stopped")
+    def on_speech_stopped(*args, **kwargs):
+        send_pulse(0.0)
+        
+    @session.on("agent_stopped_speaking")
+    def on_stopped_speaking(*args, **kwargs):
+        send_pulse(0.0)
+        
+    # Keeps session alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
         await asyncio.sleep(1)
 
