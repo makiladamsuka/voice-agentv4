@@ -14,7 +14,7 @@ def start_services():
     
     # Start the LiveKit voice agent service
     print("🗣️ Starting LiveKit Voice Agent...")
-    voice_proc = subprocess.Popen([sys.executable, "voice_agent.py", "start"])
+    voice_proc = subprocess.Popen([sys.executable, "voice_agent.py", "dev"])
     
     try:
         # Keep the main thread alive watching both
