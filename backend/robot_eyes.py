@@ -1757,21 +1757,19 @@ try:
             left_eye.target_scale_w += reengage_bump
             left_eye.target_scale_h += reengage_bump * 0.70
             
-        # Optional: Rhythmic bounce when the LLM is speaking
-        speak_bounce = 0.0
+        # Give the eyes a static shape shift (taller, slightly raised) when the agent talks
+        speak_bump = 0.0
         if udp_speak_pulse > 0.0:
-            pulse_hz = 2.5 # Slower so the physics engine can keep up
-            # Make the bounce 5x bigger so it's blatantly obvious
-            speak_bounce = max(0.0, math.sin(now * math.pi * 2.0 * pulse_hz)) * 0.15
-            left_eye.target_scale_h += speak_bounce
-            left_eye.target_pos[1] -= speak_bounce * 40.0
+            speak_bump = 0.20 # 20% taller
+            left_eye.target_scale_h += speak_bump
+            left_eye.target_pos[1] -= 25.0
         left_eye.update()
         if reengage_bump > 0.0:
             left_eye.target_scale_w -= reengage_bump
             left_eye.target_scale_h -= reengage_bump * 0.70
-        if speak_bounce > 0.0:
-            left_eye.target_scale_h -= speak_bounce
-            left_eye.target_pos[1] += speak_bounce * 40.0
+        if speak_bump > 0.0:
+            left_eye.target_scale_h -= speak_bump
+            left_eye.target_pos[1] += 25.0
         mirror_full_state(left_eye, right_eye)
         
         # 6. Draw
