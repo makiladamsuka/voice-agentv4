@@ -5,17 +5,18 @@ import time
 def start_services():
     print("🚀 Starting Dual Robot Services...")
     
-    # Start the eyes and face tracking service
+    # 1. Start the LiveKit voice agent service FIRST
+    print("🗣️ Starting LiveKit Voice Agent and generating Server URL...")
+    voice_proc = subprocess.Popen([sys.executable, "voice_agent.py", "dev"])
+    
+    # Give you 20 seconds to open the link and connect on your laptop
+    # before we blast the Pi's CPU with the camera vision model!
+    print("⏳ Waiting 20 seconds for you to connect frontend before loading eyes...")
+    time.sleep(20)
+
+    # 2. Start the eyes and face tracking service
     print("👀 Starting TFT Eyes & Face Tracker out-of-process...")
     eyes_proc = subprocess.Popen([sys.executable, "robot_eyes.py"])
-    
-    # Wait 8 seconds to let the camera and heavy YuNet AI model load
-    # before we start blasting the CPU with the LiveKit Voice AI
-    time.sleep(8)
-    
-    # Start the LiveKit voice agent service
-    print("🗣️ Starting LiveKit Voice Agent...")
-    voice_proc = subprocess.Popen([sys.executable, "voice_agent.py", "dev"])
     
     try:
         # Keep the main thread alive watching both
