@@ -55,8 +55,8 @@ FLOOR_Y = SCREEN_HEIGHT - 5
 FACE_MODEL_PATH = "face_detection_yunet_2023mar.onnx"
 # Use a larger 16:9 main stream for wider/detail-rich source frames (wider field of view)
 CAMERA_MAIN_RES = (1920, 1080)
-# Balanced 16:9 processing for detail + CPU headroom (better for emotion models)
-CAMERA_RES = (1280, 720)
+# Balanced 16:9 processing for detail + CPU headroom
+CAMERA_RES = (640, 360)
 STREAM_RES = (320, 180)   # Downscaled for web preview (maintain 16:9, no lag)
 CONFIDENCE_THRESHOLD = 0.6
 NMS_THRESHOLD = 0.3

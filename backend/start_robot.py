@@ -9,8 +9,9 @@ def start_services():
     print("👀 Starting TFT Eyes & Face Tracker out-of-process...")
     eyes_proc = subprocess.Popen([sys.executable, "robot_eyes.py"])
     
-    # Wait a tiny bit to avoid simultaneous heavy console I/O
-    time.sleep(2)
+    # Wait 8 seconds to let the camera and heavy YuNet AI model load
+    # before we start blasting the CPU with the LiveKit Voice AI
+    time.sleep(8)
     
     # Start the LiveKit voice agent service
     print("🗣️ Starting LiveKit Voice Agent...")
