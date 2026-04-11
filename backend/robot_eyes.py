@@ -16,7 +16,13 @@ import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 import cv2
+import socket
+import json
 from pathlib import Path
+
+udp_emotion_override = None
+udp_emotion_until = 0.0
+udp_speak_pulse = 0.0
 
 # Hardware / Display Imports
 import board
@@ -1197,6 +1203,28 @@ def mirror_full_state(master, slave):
     slave.h = master.h
 
 
+def udp_worker():
+    global udp_emotion_override, udp_emotion_until, udp_speak_pulse
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 9000))
+    sock.settimeout(0.5)
+    print("UDP Listener active on port 9000")
+    while running:
+        try:
+            data, _ = sock.recvfrom(1024)
+            msg = json.loads(data.decode("utf-8"))
+            if "emotion" in msg:
+                udp_emotion_override = msg["emotion"]
+                # Lock the emotion for 5 seconds locally or until another comes
+                udp_emotion_until = time.time() + 5.0
+                print(f"[UDP] Received emotion override: {udp_emotion_override}")
+            if "speak_pulse" in msg:
+                udp_speak_pulse = float(msg["speak_pulse"])
+        except socket.timeout:
+            pass
+        except Exception as e:
+            pass
+
 def vision_worker():
     global running, target_x_off, target_y_off, target_rotation, target_squint
     global target_face_present, target_face_area_ratio, target_face_count
@@ -1350,6 +1378,9 @@ if ENABLE_SERVO:
 
 vision_thread = threading.Thread(target=vision_worker, daemon=True)
 vision_thread.start()
+
+udp_thread = threading.Thread(target=udp_worker, daemon=True)
+udp_thread.start()
 
 try:
     while running:
@@ -1554,6 +1585,10 @@ try:
         else:
             target_emotion = current_emotion
 
+        # --- IMPORTANT UDP AI OVERRIDE ---
+        if udp_emotion_override and now < udp_emotion_until:
+            target_emotion = udp_emotion_override
+
         if multi_face_entered and now >= jerk_cooldown_until:
             # When a new face appears (2+ total), jerk toward current look direction.
             jerk_direction = -1.0 if smoothed_x_off < 0 else 1.0
@@ -1721,10 +1756,21 @@ try:
             reengage_bump = max(0.0, min(1.0, phase)) * 0.035
             left_eye.target_scale_w += reengage_bump
             left_eye.target_scale_h += reengage_bump * 0.70
+            
+        # Optional: Subtle rhythmic bounce when the LLM is speaking
+        speak_bounce = 0.0
+        if udp_speak_pulse > 0.0:
+            pulse_hz = 5.0
+            speak_bounce = max(0.0, math.sin(now * math.pi * 2.0 * pulse_hz)) * 0.035
+            left_eye.target_scale_h -= speak_bounce
+            left_eye.target_pos[1] -= speak_bounce * 25.0
         left_eye.update()
         if reengage_bump > 0.0:
             left_eye.target_scale_w -= reengage_bump
             left_eye.target_scale_h -= reengage_bump * 0.70
+        if speak_bounce > 0.0:
+            left_eye.target_scale_h += speak_bounce
+            left_eye.target_pos[1] += speak_bounce * 25.0
         mirror_full_state(left_eye, right_eye)
         
         # 6. Draw

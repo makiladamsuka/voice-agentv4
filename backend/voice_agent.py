@@ -1,6 +1,6 @@
 from dotenv import load_dotenv
 from livekit import agents, rtc
-from tools import TimeTools, SearchTools
+from tools import TimeTools, SearchTools, EmotionTools
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
 from livekit.plugins import openai, deepgram, silero
 import os
@@ -20,7 +20,7 @@ def prewarm(proc: agents.JobProcess):
         prefix_padding_duration=0.2
     )
 
-class SimpleVoiceAgent(Agent, TimeTools, SearchTools):
+class SimpleVoiceAgent(Agent, TimeTools, SearchTools, EmotionTools):
     def __init__(self):
         from prompt import SYSTEM_INSTRUCTIONS
         super().__init__(
