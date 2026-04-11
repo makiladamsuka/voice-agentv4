@@ -34,3 +34,4 @@ vaderSentiment
 
 # Utilities
 python-dotenv==1.2.1
+duckduckgo-search

@@ -1,5 +1,5 @@
 from livekit.agents import RunContext, function_tool
-from ddgs import DDGS
+from duckduckgo_search import DDGS
 import asyncio
 import logging
 
