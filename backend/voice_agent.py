@@ -35,7 +35,7 @@ async def entrypoint(ctx: agents.JobContext):
             interruption={"mode": "vad"}
         ),
         stt=deepgram.STT(model="nova-2"),
-        tts=AmplitudeTTS(model="aura-luna-en"),
+        tts=AmplitudeTTS(model="aura-2-luna-en"),
         vad=silero.VAD.load(
             min_speech_duration=0.1,
             min_silence_duration=0.2, 
