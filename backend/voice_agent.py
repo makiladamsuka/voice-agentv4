@@ -7,29 +7,81 @@ from amplitude_tts import AmplitudeTTS, _drain_to_zero
 import os
 import asyncio
 import datetime
+import socket
+import json
 from pathlib import Path
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Load environment variables
 env_path = Path(__file__).parent / ".env"
 load_dotenv(env_path)
 
+# ── Shared UDP socket ──────────────────────────────────────────────────────────
+_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_EYES = ("127.0.0.1", 9000)
+
+def _udp(payload: dict):
+    try:
+        _sock.sendto(json.dumps(payload).encode(), _EYES)
+    except Exception:
+        pass
+
+# ── VADER analyzer ─────────────────────────────────────────────────────────────
+_analyzer = SentimentIntensityAnalyzer()
+
+def _send_vader_emotion(text: str):
+    """Layer 1: VADER — slow mood backdrop from utterance sentiment."""
+    if not text or len(text.split()) < 2:
+        return
+    comp = _analyzer.polarity_scores(text)["compound"]
+    if comp > 0.6:    emotion = "happy"
+    elif comp > 0.2:  emotion = "warm"
+    elif comp < -0.6: emotion = "angry"
+    elif comp < -0.2: emotion = "sad"
+    else:             emotion = "engaged"
+    _udp({"command": "emotion", "emotion": emotion})
+    print(f"🤖 [Vader L1] '{text[:40]}' -> {comp:.2f} -> {emotion}")
+
+# ── Conversation state machine ─────────────────────────────────────────────────
+_thinking_task: asyncio.Task | None = None
+
+async def _thinking_cycle():
+    """Cycle through thinking → remembering → concentrating while LLM processes."""
+    emotions = ["thinking", "remembering", "concentrating"]
+    i = 0
+    while True:
+        e = emotions[i % len(emotions)]
+        _udp({"command": "conv_state", "state": "thinking", "emotion": e})
+        print(f"🧠 [ConvState L2] THINKING cycle -> {e}")
+        i += 1
+        await asyncio.sleep(1.5)
+
+def _set_conv_state(state: str, emotion: str | None = None):
+    """Send a conversation state packet. Cancels any running thinking cycle."""
+    global _thinking_task
+    if _thinking_task and not _thinking_task.done():
+        _thinking_task.cancel()
+        _thinking_task = None
+    _udp({"command": "conv_state", "state": state, "emotion": emotion or state})
+    print(f"👁  [ConvState L2] -> {state} ({emotion or state})")
+
+
 def prewarm(proc: agents.JobProcess):
     """Pre-load models to cache them in the worker process before jobs arrive."""
     silero.VAD.load(
         min_speech_duration=0.1,
-        min_silence_duration=0.2, 
+        min_silence_duration=0.2,
         prefix_padding_duration=0.2
     )
 
 class SimpleVoiceAgent(Agent, TimeTools, SearchTools):
     def __init__(self):
         from prompt import SYSTEM_INSTRUCTIONS
-        super().__init__(
-            instructions=SYSTEM_INSTRUCTIONS
-        )
+        super().__init__(instructions=SYSTEM_INSTRUCTIONS)
 
 async def entrypoint(ctx: agents.JobContext):
-    # Create session immediately 
+    global _thinking_task
+
     session = AgentSession(
         turn_handling=agents.TurnHandlingOptions(
             interruption={"mode": "vad"}
@@ -38,7 +90,7 @@ async def entrypoint(ctx: agents.JobContext):
         tts=AmplitudeTTS(model="aura-2-luna-en"),
         vad=silero.VAD.load(
             min_speech_duration=0.1,
-            min_silence_duration=0.2, 
+            min_silence_duration=0.2,
             prefix_padding_duration=0.2
         ),
         llm=openai.LLM(
@@ -47,74 +99,54 @@ async def entrypoint(ctx: agents.JobContext):
             model="llama-3.3-70b-versatile"
         ),
     )
-    
-    # Create agent
+
     agent = SimpleVoiceAgent()
-    
-    # START SESSION
     print("🚀 Starting LiveKit session...")
     await session.start(room=ctx.room, agent=agent)
-    
-    await session.say("Hello! I am your voice assistant. How can I help you today?")
-    
-    # --- Sentiment / Vader emotion analysis ---
-    import socket
-    import json
-    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-    
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    analyzer = SentimentIntensityAnalyzer()
+    await session.say("Oh hi! I am so happy you are talking to me!")
 
-    def analyze_and_send_emotion(text: str):
-        if not text or not text.strip(): return
-        if len(text.split()) < 2: return
-        
-        scores = analyzer.polarity_scores(text)
-        comp = scores['compound']
-        
-        if comp > 0.6: emotion = "happy"
-        elif comp > 0.2: emotion = "warm"
-        elif comp < -0.6: emotion = "angry"
-        elif comp < -0.2: emotion = "sad"
-        else: emotion = "engaged"
+    # ── State 1: LISTENING — user starts speaking ──────────────────────────────
+    try:
+        @session.on("user_input_speech_started")
+        def on_user_started(*args, **kwargs):
+            _set_conv_state("listening", "attentive")
+    except Exception:
+        pass  # Not available in this SDK version
 
-        try:
-            payload = json.dumps({"command": "emotion", "emotion": emotion}).encode("utf-8")
-            sock.sendto(payload, ("127.0.0.1", 9000))
-            print(f"🤖 [Vader] '{text[:40]}...' -> Score: {comp:.2f} -> {emotion}")
-        except:
-            pass
-
-    @session.on("agent_speech_committed")
-    def on_agent_speech_committed(msg):
+    # ── State 2: THINKING — user finished, LLM is processing ──────────────────
+    @session.on("user_speech_committed")
+    def on_user_speech_committed(msg):
+        global _thinking_task
+        _thinking_task = asyncio.create_task(_thinking_cycle())
         try:
             text = str(msg)
-            if hasattr(msg, "content"): text = msg.content
-            elif hasattr(msg, "text"): text = msg.text
-            elif isinstance(msg, dict) and "content" in msg: text = msg["content"]
-            analyze_and_send_emotion(text)
+            if hasattr(msg, "content"):  text = msg.content
+            elif hasattr(msg, "text"):   text = msg.text
+            _send_vader_emotion(text)
+        except Exception:
+            pass
+
+    # ── State 3: SPEAKING — agent response committed, audio starting ───────────
+    @session.on("agent_speech_committed")
+    def on_agent_speech_committed(msg):
+        _set_conv_state("speaking", "engaged")
+        try:
+            text = str(msg)
+            if hasattr(msg, "content"):  text = msg.content
+            elif hasattr(msg, "text"):   text = msg.text
+            _send_vader_emotion(text)
         except Exception as e:
             print("Vader Error:", e)
 
-    @session.on("user_speech_committed")
-    def on_user_speech_committed(msg):
-        try:
-            text = str(msg)
-            if hasattr(msg, "content"): text = msg.content
-            elif hasattr(msg, "text"): text = msg.text
-            elif isinstance(msg, dict) and "content" in msg: text = msg["content"]
-            analyze_and_send_emotion(text)
-        except Exception as e:
-            pass
-
-    # Drain amplitude to zero when agent finishes talking (insurance)
+    # ── State 4: WAITING — agent finishes speaking, room goes quiet ───────────
     @ctx.room.on("active_speakers_changed")
     def on_speakers_changed(speakers):
-        speaking = any(
+        agent_speaking = any(
             p.sid == ctx.room.local_participant.sid for p in speakers
         )
-        if not speaking:
+        if not agent_speaking:
             _drain_to_zero()
+            _set_conv_state("waiting", "attentive")
 
     # Keeps session alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:

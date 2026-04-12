@@ -23,10 +23,14 @@ from pathlib import Path
 # Shared amplitude state written by the UDP thread, read by the render loop
 udp_emotion_override = None
 udp_emotion_until = 0.0
-amplitude_fast = 0.0   # α=0.6, syllable-level micro-reactions
-amplitude_slow = 0.0   # α=0.05, emotional momentum
+amplitude_fast = 0.0   # alpha=0.6, syllable-level micro-reactions
+amplitude_slow = 0.0   # alpha=0.05, emotional momentum
 amplitude_prev_fast = 0.0  # previous frame fast value, used for derivative
-udp_speak_pulse = 0.0  # legacy fallback, kept so old logs don't crash
+udp_speak_pulse = 0.0  # 1.0 when agent is speaking, 0.0 otherwise
+
+# Layer 2: Conversation state (listening | thinking | speaking | waiting)
+udp_conv_state = "waiting"        # current conversation phase
+udp_conv_emotion = "attentive"    # emotion the conv-state wants to display
 
 # Hardware / Display Imports
 import board
@@ -1211,6 +1215,7 @@ def mirror_full_state(master, slave):
 def udp_worker():
     global udp_emotion_override, udp_emotion_until, udp_speak_pulse
     global amplitude_fast, amplitude_slow
+    global udp_conv_state, udp_conv_emotion
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 9000))
     sock.settimeout(0.5)
@@ -1220,19 +1225,28 @@ def udp_worker():
             data, _ = sock.recvfrom(1024)
             msg = json.loads(data.decode("utf-8"))
 
-            # New: real amplitude signals from AmplitudeTTS
+            # Layer 3: Real amplitude signals from AmplitudeTTS (40ms cadence)
             if "amplitude_fast" in msg:
                 amplitude_fast = float(msg["amplitude_fast"])
                 amplitude_slow = float(msg["amplitude_slow"])
-                # Back-compat: keep udp_speak_pulse truthy when audio is live
                 udp_speak_pulse = 1.0 if amplitude_fast > 0.01 else 0.0
 
-            # Legacy: Vader emotion overrides
-            if "command" in msg and msg["command"] == "emotion":
-                udp_emotion_override = msg.get("emotion")
-                udp_emotion_until = time.time() + 5.0
+            # Layer 2: Conversation state override
+            if msg.get("command") == "conv_state":
+                udp_conv_state  = msg.get("state", "waiting")
+                udp_conv_emotion = msg.get("emotion", "attentive")
+                # Treat speaking / listening states as active speech pulse
+                if udp_conv_state == "speaking":
+                    udp_speak_pulse = 1.0
+                elif udp_conv_state in ("waiting", "listening", "thinking"):
+                    udp_speak_pulse = 0.0
 
-            # Legacy fallback binary pulse (older code path)
+            # Layer 1: VADER emotion backdrop
+            if msg.get("command") == "emotion":
+                udp_emotion_override = msg.get("emotion")
+                udp_emotion_until = time.time() + 8.0   # VADER holds for 8s
+
+            # Legacy fallback binary pulse
             if "speak_pulse" in msg:
                 udp_speak_pulse = float(msg["speak_pulse"])
 
@@ -1246,6 +1260,7 @@ def vision_worker():
     global target_face_present, target_face_area_ratio, target_face_count
     global squint_until, latest_frame, servo_target_pan, servo_target_tilt, last_face_seen_ts, next_talk_saccade_ts
     global amplitude_fast, amplitude_slow, amplitude_prev_fast
+    global udp_conv_state, udp_conv_emotion
 
     interval = 1.0 / max(1.0, float(VISION_FPS))
     next_tick = time.perf_counter()
@@ -1602,9 +1617,21 @@ try:
         else:
             target_emotion = current_emotion
 
-        # --- IMPORTANT UDP AI OVERRIDE ---
+        # ── 3-LAYER EMOTION PRIORITY ──────────────────────────────────────────
+        # Layer 1 (VADER) overrides the face-tracker baseline
         if udp_emotion_override and now < udp_emotion_until:
             target_emotion = udp_emotion_override
+        # Layer 2 (Conversation state) overrides VADER when robot is active
+        # listening/thinking are high-priority: snap the emotion immediately
+        if udp_conv_state in ("listening", "thinking"):
+            target_emotion = udp_conv_emotion
+        # speaking: let VADER bleed back after the first 2s of speech
+        elif udp_conv_state == "speaking":
+            if udp_speak_pulse > 0.0:
+                # If amplitude is live, keep VADER or use engaged as floor
+                if not (udp_emotion_override and now < udp_emotion_until):
+                    target_emotion = "engaged"
+        # ─────────────────────────────────────────────────────────────────────
 
         if multi_face_entered and now >= jerk_cooldown_until:
             # When a new face appears (2+ total), jerk toward current look direction.
