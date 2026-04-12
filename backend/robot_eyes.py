@@ -1418,17 +1418,45 @@ udp_thread = threading.Thread(target=udp_worker, daemon=True)
 udp_thread.start()
 
 try:
+    # ── Tracking & Emotion History (Pre-Initialization to prevent crashes) ──
+    prev_face_area_ratio = 0.0
+    face_count_history = []
+    router_face_count_prev = 0
+    router_face_present_prev = False
+    router_multi_face_prev = False
+    router_face_close = False
+    face_present_since_ts = 0.0
+    no_face_since_ts = time.time()
+    no_face_scan_checks = 0
+    
+    multi_face_candidate = False
+    multi_face_stable = False
+    multi_face_candidate_since = 0.0
+    
+    no_face_blend_until = 0.0
+    no_face_blend_queue = []
+    no_face_blend_emotion = "idle"
+    
+    side_dir_state = 0
+    side_dir_last_switch_ts = 0.0
+    side_look_active = False
+    
+    router_candidate_emotion = "idle"
+    router_candidate_since = 0.0
+    social_mode = "neutral"
+    social_mode_until = 0.0
+    
+    smoothed_x_off = 0.0
+    smoothed_y_off = 0.0
+    smoothed_rotation = 0.0
+    
+    print("🎨 Render Loop initialized. Starting displays...")
+    
     while running:
         loop_start = time.perf_counter()
         now = time.time()
-    prev_face_area_ratio = 0.0
-    face_count_history = []  # Keep track of timestamps when face count changed
-    local_face_count = 0
-    
-    while running:
-        now = time.perf_counter()
         
-        # Update trackers
+        # 1. Update Tracking Context
         with target_lock:
             local_target_x = target_x_off
             local_target_y = target_y_off
@@ -1449,7 +1477,7 @@ try:
         
         # Snapshot current for next frame
         prev_face_area_ratio = local_face_area_ratio
-
+ 
         # Smooth tracking to reduce jitter
         smooth_alpha = 0.15
         smoothed_x_off = smoothed_x_off + (local_target_x - smoothed_x_off) * smooth_alpha
