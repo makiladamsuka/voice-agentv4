@@ -149,9 +149,17 @@ async def entrypoint(ctx: agents.JobContext):
     await session.say("Oh hi! I am so happy you are talking to me!")
 
     # ── State 1: LISTENING / WAITING (Precise VAD) ───────────────────────────
+    async def _hearing_reflex():
+        """Stage 1: The 'Startle' — robot perks up when hearing voice."""
+        # Pulse to excited immediately to show hearing
+        _udp({"command": "conv_state", "state": "listening", "emotion": "excited"})
+        await asyncio.sleep(0.4)
+        # Settle into attentive listening
+        _udp({"command": "conv_state", "state": "listening", "emotion": "attentive"})
+
     @session.on("user_started_speaking")
     def on_user_started():
-        _set_conv_state("listening", "attentive")
+        asyncio.create_task(_hearing_reflex())
 
     @session.on("user_stopped_speaking")
     def on_user_stopped():
