@@ -59,7 +59,12 @@ def _rms(pcm_bytes: bytes) -> float:
     # struct.unpack is faster than numpy on short chunks
     samples = struct.unpack(f"<{n}h", pcm_bytes[:n * 2])
     rms = math.sqrt(sum(s * s for s in samples) / n)
-    return min(rms / 32768.0, 1.0)  # normalise INT16 → [0, 1]
+    
+    # Normalise INT16 -> [0, 1] then apply a x4 gain boost
+    # This ensures even quiet speech drives the physical eyes
+    normalised = min(rms / 32768.0, 1.0)
+    boosted = min(normalised * 4.0, 1.0)
+    return boosted
 
 
 def _process_chunk(pcm_bytes: bytes) -> None:

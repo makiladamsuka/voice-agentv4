@@ -1233,13 +1233,16 @@ def udp_worker():
 
             # Layer 2: Conversation state override
             if msg.get("command") == "conv_state":
-                udp_conv_state  = msg.get("state", "waiting")
+                new_state = msg.get("state", "waiting")
+                udp_conv_state  = new_state
                 udp_conv_emotion = msg.get("emotion", "attentive")
-                # Treat speaking / listening states as active speech pulse
-                if udp_conv_state == "speaking":
-                    udp_speak_pulse = 1.0
-                elif udp_conv_state in ("waiting", "listening", "thinking"):
-                    udp_speak_pulse = 0.0
+                
+                # Treat speaking state as an active pulse only if we don't have real amplitude yet
+                if new_state == "speaking":
+                    if udp_speak_pulse <= 0.0: udp_speak_pulse = 0.5
+                elif new_state in ("waiting", "listening", "thinking"):
+                    # Don't kill pulse immediately if thinking, let decay happen
+                    pass
 
             # Layer 1: VADER emotion backdrop
             if msg.get("command") == "emotion":
@@ -1418,7 +1421,14 @@ try:
     while running:
         loop_start = time.perf_counter()
         now = time.time()
-
+    prev_face_area_ratio = 0.0
+    face_count_history = []  # Keep track of timestamps when face count changed
+    local_face_count = 0
+    
+    while running:
+        now = time.perf_counter()
+        
+        # Update trackers
         with target_lock:
             local_target_x = target_x_off
             local_target_y = target_y_off
@@ -1427,6 +1437,18 @@ try:
             local_face_present = target_face_present
             local_face_area_ratio = target_face_area_ratio
             local_face_count = target_face_count
+        
+        area_ratio_delta = abs(local_face_area_ratio - prev_face_area_ratio)
+        
+        # Track face count changes over last 3 seconds
+        if local_face_count != router_face_count_prev:
+            face_count_history.append(now)
+        face_count_history = [t for t in face_count_history if now - t < 3.0]
+        face_count_changes = len(face_count_history)
+        router_face_count_prev = local_face_count
+        
+        # Snapshot current for next frame
+        prev_face_area_ratio = local_face_area_ratio
 
         # Smooth tracking to reduce jitter
         smooth_alpha = 0.15
@@ -1608,7 +1630,24 @@ try:
             else:
                 target_emotion_raw = "warm"
 
-        # Debounce route output so brief detector spikes do not force emotion flips.
+        # ── LAYER 4: VISION-BASED TRIGGERS ────────────────────────────────────
+        # Surprised: Sharp jumps in face size or sudden appearance
+        area_delta = abs(local_face_area_ratio - prev_face_area_ratio)
+        if (face_entered and area_delta > 0.05) or area_delta > 0.15:
+            target_emotion_raw = "surprised"
+            emotion_force_until = now + 1.5
+
+        # Suspicious: Very unstable face count (people popping in/out)
+        if face_count_changes > 3:
+            target_emotion_raw = "suspicious"
+            emotion_force_until = now + 2.0
+
+        # Playful: Talking but no face is here
+        if not local_face_present and udp_speak_pulse > 0.1:
+            target_emotion_raw = "playful"
+        # ─────────────────────────────────────────────────────────────────────
+
+        # Debounce route output
         if target_emotion_raw != router_candidate_emotion:
             router_candidate_emotion = target_emotion_raw
             router_candidate_since = now
@@ -1621,16 +1660,30 @@ try:
         # Layer 1 (VADER) overrides the face-tracker baseline
         if udp_emotion_override and now < udp_emotion_until:
             target_emotion = udp_emotion_override
-        # Layer 2 (Conversation state) overrides VADER when robot is active
-        # listening/thinking are high-priority: snap the emotion immediately
-        if udp_conv_state in ("listening", "thinking"):
+
+        # Layer 2 (Conversation state) overrides everything when robot is active
+        # High priority "handshake" states
+        if udp_conv_state in ("listening", "thinking", "nodding", "remembering", "concentrating"):
             target_emotion = udp_conv_emotion
-        # speaking: let VADER bleed back after the first 2s of speech
+        
+        # Speaking: Baseline is engaged, but VADER/Amplitude can override it
         elif udp_conv_state == "speaking":
-            if udp_speak_pulse > 0.0:
-                # If amplitude is live, keep VADER or use engaged as floor
-                if not (udp_emotion_override and now < udp_emotion_until):
-                    target_emotion = "engaged"
+            # Check Layer 3: Amplitude Dynamics
+            if amplitude_slow > 0.5: # Sustained loud speech
+                target_emotion = "excited"
+            elif amplitude_fast - amplitude_prev_fast > 0.3: # Mid-sentence spike
+                target_emotion = "amused"
+            elif not (udp_emotion_override and now < udp_emotion_until):
+                target_emotion = "engaged"
+            else:
+                target_emotion = udp_emotion_override
+        
+        # Waiting/Idle: VADER mood holds, but conv-state can trigger awkward
+        elif udp_conv_state == "waiting":
+            if udp_conv_emotion == "awkward":
+                target_emotion = "awkward"
+            elif udp_emotion_override and now < udp_emotion_until:
+                target_emotion = udp_emotion_override
         # ─────────────────────────────────────────────────────────────────────
 
         if multi_face_entered and now >= jerk_cooldown_until:

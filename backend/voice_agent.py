@@ -26,42 +26,85 @@ def _udp(payload: dict):
     except Exception:
         pass
 
-# ── VADER analyzer ─────────────────────────────────────────────────────────────
+# ── State 1: Mood Tracking (VADER) ──────────────────────────────────────────
 _analyzer = SentimentIntensityAnalyzer()
 
-def _send_vader_emotion(text: str):
+def _send_vader_emotion(text: str, is_agent: bool = False):
     """Layer 1: VADER — slow mood backdrop from utterance sentiment."""
     if not text or len(text.split()) < 2:
         return
+    words = text.split()
+    word_count = len(words)
     comp = _analyzer.polarity_scores(text)["compound"]
-    if comp > 0.6:    emotion = "happy"
-    elif comp > 0.2:  emotion = "warm"
-    elif comp < -0.6: emotion = "angry"
-    elif comp < -0.2: emotion = "sad"
-    else:             emotion = "engaged"
+    
+    emotion = "engaged" # default floor
+    
+    if comp > 0.6: 
+        emotion = "happy"
+    elif comp > 0.2: 
+        emotion = "warm"
+    elif comp < -0.2: 
+        if is_agent or "sorry" in text.lower():
+            emotion = "apologetic"
+        else:
+            emotion = "sad"
+    elif comp < -0.6:
+        emotion = "angry"
+    
+    # Special context overrides
+    if -0.2 <= comp <= 0.2 and word_count > 10:
+        emotion = "engaged"
+    if comp > 0.3 and word_count > 15 and is_agent:
+        emotion = "proud"
+
     _udp({"command": "emotion", "emotion": emotion})
-    print(f"🤖 [Vader L1] '{text[:40]}' -> {comp:.2f} -> {emotion}")
+    print(f"🤖 [Vader L1] {'Agent' if is_agent else 'User'} said: '{text[:30]}...' -> {comp:.2f} -> {emotion}")
 
-# ── Conversation state machine ─────────────────────────────────────────────────
+# ── State 2: Conversation state machine ─────────────────────────────────────────────────
 _thinking_task: asyncio.Task | None = None
+_awkward_timer_task: asyncio.Task | None = None
 
-async def _thinking_cycle():
-    """Cycle through thinking → remembering → concentrating while LLM processes."""
-    emotions = ["thinking", "remembering", "concentrating"]
-    i = 0
-    while True:
-        e = emotions[i % len(emotions)]
-        _udp({"command": "conv_state", "state": "thinking", "emotion": e})
-        print(f"🧠 [ConvState L2] THINKING cycle -> {e}")
-        i += 1
-        await asyncio.sleep(1.5)
+async def _thinking_cycle(word_count: int):
+    """
+    State 2 Processing:
+    0 - 0.5s: nodding
+    0.5s - 2.0s: thinking OR concentrating
+    2.0s+: remembering
+    """
+    # Acknowledge immediately
+    _udp({"command": "conv_state", "state": "nodding", "emotion": "nodding"})
+    await asyncio.sleep(0.5)
+
+    # Decide between thinking and concentrating
+    base_state = "concentrating" if word_count > 15 else "thinking"
+    _udp({"command": "conv_state", "state": base_state, "emotion": base_state})
+    
+    await asyncio.sleep(1.5) # 0.5 + 1.5 = 2.0s mark
+    
+    # Transition to deep memory
+    _udp({"command": "conv_state", "state": "remembering", "emotion": "remembering"})
+    print(f"🧠 [ConvState L2] Transitioned to REMEMBERING...")
+    
+    while True: # Keep cycling subtle variations if LLM is slow
+        await asyncio.sleep(3.0)
+        _udp({"command": "conv_state", "state": "thinking", "emotion": "thinking"})
+        await asyncio.sleep(3.0)
+        _udp({"command": "conv_state", "state": "remembering", "emotion": "remembering"})
+
+async def _awkward_timer():
+    """Timer that triggers 'awkward' after 5s of silence."""
+    await asyncio.sleep(5.0)
+    _udp({"command": "conv_state", "state": "waiting", "emotion": "awkward"})
+    print("😶 [ConvState L2] Situation is getting AWKWARD...")
 
 def _set_conv_state(state: str, emotion: str | None = None):
-    """Send a conversation state packet. Cancels any running thinking cycle."""
-    global _thinking_task
+    """Send a conversation state packet. Cancels active timers."""
+    global _thinking_task, _awkward_timer_task
     if _thinking_task and not _thinking_task.done():
         _thinking_task.cancel()
-        _thinking_task = None
+    if _awkward_timer_task and not _awkward_timer_task.done():
+        _awkward_timer_task.cancel()
+    
     _udp({"command": "conv_state", "state": state, "emotion": emotion or state})
     print(f"👁  [ConvState L2] -> {state} ({emotion or state})")
 
@@ -80,7 +123,7 @@ class SimpleVoiceAgent(Agent, TimeTools, SearchTools):
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
 
 async def entrypoint(ctx: agents.JobContext):
-    global _thinking_task
+    global _thinking_task, _awkward_timer_task
 
     session = AgentSession(
         turn_handling=agents.TurnHandlingOptions(
@@ -117,12 +160,15 @@ async def entrypoint(ctx: agents.JobContext):
     @session.on("user_speech_committed")
     def on_user_speech_committed(msg):
         global _thinking_task
-        _thinking_task = asyncio.create_task(_thinking_cycle())
+        text = str(msg)
+        if hasattr(msg, "content"):  text = msg.content
+        elif hasattr(msg, "text"):   text = msg.text
+        
+        word_count = len(text.split())
+        _thinking_task = asyncio.create_task(_thinking_cycle(word_count))
+        
         try:
-            text = str(msg)
-            if hasattr(msg, "content"):  text = msg.content
-            elif hasattr(msg, "text"):   text = msg.text
-            _send_vader_emotion(text)
+            _send_vader_emotion(text, is_agent=False)
         except Exception:
             pass
 
@@ -134,19 +180,31 @@ async def entrypoint(ctx: agents.JobContext):
             text = str(msg)
             if hasattr(msg, "content"):  text = msg.content
             elif hasattr(msg, "text"):   text = msg.text
-            _send_vader_emotion(text)
+            _send_vader_emotion(text, is_agent=True)
         except Exception as e:
             print("Vader Error:", e)
 
-    # ── State 4: WAITING — agent finishes speaking, room goes quiet ───────────
+    # ── State 4: WAITING — agent finishes speaking ───────────────────────────
     @ctx.room.on("active_speakers_changed")
     def on_speakers_changed(speakers):
-        agent_speaking = any(
-            p.sid == ctx.room.local_participant.sid for p in speakers
-        )
-        if not agent_speaking:
+        global _awkward_timer_task
+        agent_speaking = any(p.sid == ctx.room.local_participant.sid for p in speakers)
+        user_speaking = any(p.sid != ctx.room.local_participant.sid for p in speakers)
+
+        if user_speaking:
+            _set_conv_state("listening", "attentive")
+        elif agent_speaking:
+            # If we were waiting/awkward, clear the timer
+            if _awkward_timer_task and not _awkward_timer_task.done():
+                _awkward_timer_task.cancel()
+        else:
+            # Nobody is talking -> WAITING
             _drain_to_zero()
             _set_conv_state("waiting", "attentive")
+            # Start the awkward countdown
+            if _awkward_timer_task and not _awkward_timer_task.done():
+                _awkward_timer_task.cancel()
+            _awkward_timer_task = asyncio.create_task(_awkward_timer())
 
     # Keeps session alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
