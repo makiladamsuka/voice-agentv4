@@ -20,9 +20,13 @@ import socket
 import json
 from pathlib import Path
 
+# Shared amplitude state written by the UDP thread, read by the render loop
 udp_emotion_override = None
 udp_emotion_until = 0.0
-udp_speak_pulse = 0.0
+amplitude_fast = 0.0   # α=0.6, syllable-level micro-reactions
+amplitude_slow = 0.0   # α=0.05, emotional momentum
+amplitude_prev_fast = 0.0  # previous frame fast value, used for derivative
+udp_speak_pulse = 0.0  # legacy fallback, kept so old logs don't crash
 
 # Hardware / Display Imports
 import board
@@ -1206,6 +1210,7 @@ def mirror_full_state(master, slave):
 
 def udp_worker():
     global udp_emotion_override, udp_emotion_until, udp_speak_pulse
+    global amplitude_fast, amplitude_slow
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 9000))
     sock.settimeout(0.5)
@@ -1214,22 +1219,33 @@ def udp_worker():
         try:
             data, _ = sock.recvfrom(1024)
             msg = json.loads(data.decode("utf-8"))
-            if "emotion" in msg:
-                udp_emotion_override = msg["emotion"]
-                # Lock the emotion for 5 seconds locally or until another comes
+
+            # New: real amplitude signals from AmplitudeTTS
+            if "amplitude_fast" in msg:
+                amplitude_fast = float(msg["amplitude_fast"])
+                amplitude_slow = float(msg["amplitude_slow"])
+                # Back-compat: keep udp_speak_pulse truthy when audio is live
+                udp_speak_pulse = 1.0 if amplitude_fast > 0.01 else 0.0
+
+            # Legacy: Vader emotion overrides
+            if "command" in msg and msg["command"] == "emotion":
+                udp_emotion_override = msg.get("emotion")
                 udp_emotion_until = time.time() + 5.0
-                print(f"[UDP] Received emotion override: {udp_emotion_override}")
+
+            # Legacy fallback binary pulse (older code path)
             if "speak_pulse" in msg:
                 udp_speak_pulse = float(msg["speak_pulse"])
+
         except socket.timeout:
             pass
-        except Exception as e:
+        except Exception:
             pass
 
 def vision_worker():
     global running, target_x_off, target_y_off, target_rotation, target_squint
     global target_face_present, target_face_area_ratio, target_face_count
     global squint_until, latest_frame, servo_target_pan, servo_target_tilt, last_face_seen_ts, next_talk_saccade_ts
+    global amplitude_fast, amplitude_slow, amplitude_prev_fast
 
     interval = 1.0 / max(1.0, float(VISION_FPS))
     next_tick = time.perf_counter()
@@ -1750,19 +1766,28 @@ try:
             last_blink_time = time.time()
             next_blink_time = time.time() + random.uniform(2.5 if udp_speak_pulse > 0.0 else 3.5, 5.0 if udp_speak_pulse > 0.0 else 7.0)
 
-        # 4. Conversational Micro-Expressions (darting eyes while speaking)
+        # 4. SACCADE FREQUENCY + AMPLITUDE SNAPSHOT
+        #    Compute af/sl/da first — used by saccade AND physics blocks below
+        af = amplitude_fast
+        sl = amplitude_slow
+        da = af - amplitude_prev_fast
+        amplitude_prev_fast = af
+
+        saccade_gap_min = max(0.25, 0.9 - sl * 1.2)
+        saccade_gap_max = max(0.8,  2.5 - sl * 2.5)
+        saccade_reach   = 15.0 + sl * 45.0
+
         if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and not gaze_event_active:
-            # Dart randomly to emphasize speech
             sx = random.choice([-1.0, 1.0])
             start_gaze_event(
                 "AVERT_TALK",
-                sx * random.uniform(15.0, 45.0),
-                random.uniform(-30.0, 25.0),
+                sx * random.uniform(saccade_reach * 0.6, saccade_reach),
+                random.uniform(-saccade_reach * 0.5, saccade_reach * 0.4),
                 to_sec=random.uniform(0.08, 0.20),
-                hold_sec=random.uniform(0.2, 0.6),
-                back_sec=random.uniform(0.10, 0.25)
+                hold_sec=random.uniform(0.15, 0.55),
+                back_sec=random.uniform(0.10, 0.22)
             )
-            next_talk_saccade_ts = now + random.uniform(0.4, 1.4)
+            next_talk_saccade_ts = now + random.uniform(saccade_gap_min, saccade_gap_max)
 
         # Keep idle motion deterministic to avoid perceived micro-jitter.
         
@@ -1775,7 +1800,40 @@ try:
             left_eye.target_scale_w += reengage_bump
             left_eye.target_scale_h += reengage_bump * 0.70
             
+        # ── AMPLITUDE-DRIVEN BEHAVIOURS ─────────────────────────────────────
+        # af/sl/da already computed above in section 4
+
+        # 1. VERTICAL FLOAT — slow signal lifts eye with speech energy
+        float_y = -sl * 22.0
+        left_eye.target_pos[1] -= float_y
+
+        # 2. SYLLABLE PUNCH — fast rising spikes widen the eye briefly
+        #    Sudden amplitude increase → eyes flash open (surprise-like speed)
+        #    Slow gradual swell → eyes open warmly (larger multiplier, same dir)
+        if af > 0.05:
+            if da > 0.08:                # sharp spike (stressed syllable)
+                punch = da * 0.55        # strong but short
+            else:                        # gradual swell
+                punch = af * 0.18        # warm open, tied to energy level
+            left_eye.target_scale_w += punch * 0.5
+            left_eye.target_scale_h += punch
+
+        # 3. LID MICRO-DROOP — when speech pauses (fast near zero mid-sentence)
+        #    Lids droop slightly on natural breath pauses, snap back when talking
+        if udp_speak_pulse > 0.0 and af < 0.025 and sl > 0.015:
+            droop = 0.06          # ~6% lid drop — subtle, not a full blink
+            left_eye.target_scale_h -= droop
+
         left_eye.update()
+
+        # Clean up temporary target mutations so they don't accumulate
+        if af > 0.05:
+            left_eye.target_scale_w -= punch * 0.5
+            left_eye.target_scale_h -= punch
+        if udp_speak_pulse > 0.0 and af < 0.025 and sl > 0.015:
+            left_eye.target_scale_h += droop
+        left_eye.target_pos[1] += float_y   # undo float before mirror
+        # ────────────────────────────────────────────────────────────────────
         if reengage_bump > 0.0:
             left_eye.target_scale_w -= reengage_bump
             left_eye.target_scale_h -= reengage_bump * 0.70
