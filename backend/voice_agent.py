@@ -148,13 +148,20 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(room=ctx.room, agent=agent)
     await session.say("Oh hi! I am so happy you are talking to me!")
 
-    # ── State 1: LISTENING — user starts speaking ──────────────────────────────
-    try:
-        @session.on("user_input_speech_started")
-        def on_user_started(*args, **kwargs):
-            _set_conv_state("listening", "attentive")
-    except Exception:
-        pass  # Not available in this SDK version
+    # ── State 1: LISTENING / WAITING (Precise VAD) ───────────────────────────
+    @session.on("user_started_speaking")
+    def on_user_started():
+        _set_conv_state("listening", "attentive")
+
+    @session.on("user_stopped_speaking")
+    def on_user_stopped():
+        global _awkward_timer_task
+        # Return to waiting/attentive when user stops
+        _set_conv_state("waiting", "attentive")
+        # Restart awkward countdown
+        if _awkward_timer_task and not _awkward_timer_task.done():
+            _awkward_timer_task.cancel()
+        _awkward_timer_task = asyncio.create_task(_awkward_timer())
 
     # ── State 2: THINKING — user finished, LLM is processing ──────────────────
     @session.on("user_speech_committed")
@@ -164,7 +171,11 @@ async def entrypoint(ctx: agents.JobContext):
         if hasattr(msg, "content"):  text = msg.content
         elif hasattr(msg, "text"):   text = msg.text
         
-        word_count = len(text.split())
+        # CLEANUP: Filter out junk for word count
+        junk = ["uh", "um", "ah", "er", "hmm", "okay", "so", "well"]
+        clean_words = [w for w in text.lower().split() if w not in junk]
+        word_count = len(clean_words)
+        
         _thinking_task = asyncio.create_task(_thinking_cycle(word_count))
         
         try:
@@ -184,27 +195,25 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             print("Vader Error:", e)
 
-    # ── State 4: WAITING — agent finishes speaking ───────────────────────────
-    @ctx.room.on("active_speakers_changed")
-    def on_speakers_changed(speakers):
-        global _awkward_timer_task
-        agent_speaking = any(p.sid == ctx.room.local_participant.sid for p in speakers)
-        user_speaking = any(p.sid != ctx.room.local_participant.sid for p in speakers)
+    # ── State 4: AGENT SILENCE Tracking ───────────────────────────────────────
+    @session.on("agent_started_speaking")
+    def on_agent_started():
+        global _awkward_timer_task, _thinking_task
+        # Hard cancel any thinking/waiting tasks once audio is live
+        if _thinking_task and not _thinking_task.done():
+            _thinking_task.cancel()
+        if _awkward_timer_task and not _awkward_timer_task.done():
+            _awkward_timer_task.cancel()
+        _set_conv_state("speaking", "engaged")
 
-        if user_speaking:
-            _set_conv_state("listening", "attentive")
-        elif agent_speaking:
-            # If we were waiting/awkward, clear the timer
-            if _awkward_timer_task and not _awkward_timer_task.done():
-                _awkward_timer_task.cancel()
-        else:
-            # Nobody is talking -> WAITING
-            _drain_to_zero()
-            _set_conv_state("waiting", "attentive")
-            # Start the awkward countdown
-            if _awkward_timer_task and not _awkward_timer_task.done():
-                _awkward_timer_task.cancel()
-            _awkward_timer_task = asyncio.create_task(_awkward_timer())
+    @session.on("agent_stopped_speaking")
+    def on_agent_stopped():
+        global _awkward_timer_task
+        _drain_to_zero()
+        _set_conv_state("waiting", "attentive")
+        if _awkward_timer_task and not _awkward_timer_task.done():
+            _awkward_timer_task.cancel()
+        _awkward_timer_task = asyncio.create_task(_awkward_timer())
 
     # Keeps session alive
     while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:

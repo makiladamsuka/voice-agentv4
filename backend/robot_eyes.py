@@ -1229,7 +1229,8 @@ def udp_worker():
             if "amplitude_fast" in msg:
                 amplitude_fast = float(msg["amplitude_fast"])
                 amplitude_slow = float(msg["amplitude_slow"])
-                udp_speak_pulse = 1.0 if amplitude_fast > 0.01 else 0.0
+                # Lower threshold (0.005) to capture whispers better
+                udp_speak_pulse = 1.0 if amplitude_fast > 0.005 else 0.0
 
             # Layer 2: Conversation state override
             if msg.get("command") == "conv_state":
