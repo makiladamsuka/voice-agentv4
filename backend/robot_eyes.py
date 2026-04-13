@@ -1341,8 +1341,10 @@ def vision_worker():
                         mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
                         mapped_tilt = clamp(tilt_center + (norm_y * TILT_TRACK_RANGE), TILT_MIN, TILT_MAX)
                         with servo_state_lock:
-                            servo_target_pan = servo_target_pan + (mapped_pan - servo_target_pan) * TARGET_FILTER_ALPHA
-                            servo_target_tilt = servo_target_tilt + (mapped_tilt - servo_target_tilt) * TARGET_FILTER_ALPHA
+                            # Damp tracking when speaking to prioritize gestures
+                            current_alpha = TARGET_FILTER_ALPHA * 0.15 if udp_speak_pulse > 0.0 else TARGET_FILTER_ALPHA
+                            servo_target_pan = servo_target_pan + (mapped_pan - servo_target_pan) * current_alpha
+                            servo_target_tilt = servo_target_tilt + (mapped_tilt - servo_target_tilt) * current_alpha
                             last_face_seen_ts = time.time()
 
                     # Distance-based emotion: squint when far, excited when close
