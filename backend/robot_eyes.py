@@ -1097,6 +1097,7 @@ def update_gaze_manager(now: float):
 
 def servo_worker():
     global servo_current_pan, servo_current_tilt, servo_running, jerk_until, jerk_direction
+    global amplitude_fast, amplitude_slow, udp_speak_pulse
     if servo_kit is None:
         return
 
@@ -1120,8 +1121,17 @@ def servo_worker():
             # Sine wave oscillation: quick outward jerk, return, small reverse jerk
             jerk_offset = jerk_direction * JERK_AMPLITUDE * math.sin(phase * math.pi * 2.0)
 
-        pan_error = (pan_target + jerk_offset + pan_avert) - pan_current
-        tilt_error = (tilt_target + tilt_avert) - tilt_current
+        # Apply talk-driven subtle motion (head sway and nods)
+        subtle_pan = 0.0
+        subtle_tilt = 0.0
+        if udp_speak_pulse > 0.0:
+            # Slow horizontal sway (drift) scaled by slow energy envelope
+            subtle_pan = math.sin(now * 1.6) * (amplitude_slow * 6.5)
+            # Faster vertical "nodding" reactive to syllable peaks
+            subtle_tilt = math.cos(now * 3.2) * (amplitude_fast * 3.8)
+
+        pan_error = (pan_target + jerk_offset + pan_avert + subtle_pan) - pan_current
+        tilt_error = (tilt_target + tilt_avert + subtle_tilt) - tilt_current
 
         if abs(pan_error) < SERVO_DEADZONE_DEG:
             pan_error = 0.0
