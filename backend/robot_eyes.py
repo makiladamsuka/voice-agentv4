@@ -1882,16 +1882,17 @@ try:
         da = af - amplitude_prev_fast
         amplitude_prev_fast = af
 
-        saccade_gap_min = max(0.25, 0.9 - sl * 1.2)
-        saccade_gap_max = max(0.8,  2.5 - sl * 2.5)
-        saccade_reach   = 15.0 + sl * 45.0
+        saccade_gap_min = max(0.20, 0.7 - sl * 1.5)
+        saccade_gap_max = max(0.6,  2.0 - sl * 3.0)
+        saccade_reach   = 22.0 + sl * 60.0
+        saccade_v_reach = 12.0 + sl * 25.0
 
         if udp_speak_pulse > 0.0 and now >= next_talk_saccade_ts and not gaze_event_active:
             sx = random.choice([-1.0, 1.0])
             start_gaze_event(
                 "AVERT_TALK",
-                sx * random.uniform(saccade_reach * 0.6, saccade_reach),
-                random.uniform(-saccade_reach * 0.5, saccade_reach * 0.4),
+                sx * random.uniform(saccade_reach * 0.7, saccade_reach),
+                random.uniform(-saccade_v_reach, saccade_v_reach),
                 to_sec=random.uniform(0.08, 0.20),
                 hold_sec=random.uniform(0.15, 0.55),
                 back_sec=random.uniform(0.10, 0.22)
@@ -1912,11 +1913,16 @@ try:
         # ── AMPLITUDE-DRIVEN BEHAVIOURS ─────────────────────────────────────
         # af/sl/da already computed above in section 4
 
-        # 1. VERTICAL FLOAT — slow signal lifts eye with speech energy
+        # 1. VERTICAL FLOAT & HORIZONTAL DRIFT — slow signal drives movement
         float_y = -sl * 35.0
+        drift_x = math.sin(now * 4.5) * (sl * 15.0)
+        left_eye.target_pos[0] += drift_x
         left_eye.target_pos[1] -= float_y
 
-        # 2. SYLLABLE PUNCH — fast rising spikes widen the eye briefly
+        # 2. SYLLABLE PUNCH & JITTER — fast signals drive "pops" and "twitches"
+        #    da (delta amplitude) drives a horizontal "jitter" kick
+        jitter_x = da * 14.0
+        left_eye.target_pos[0] += jitter_x
         #    Sudden amplitude increase → eyes flash open (surprise-like speed)
         #    Slow gradual swell → eyes open warmly (larger multiplier, same dir)
         if af > 0.05:
@@ -1924,7 +1930,7 @@ try:
                 punch = da * 0.85        # strong but short
             else:                        # gradual swell
                 punch = af * 0.40        # warm open, tied to energy level
-            left_eye.target_scale_w += punch * 0.5
+            left_eye.target_scale_w += punch * 0.10
             left_eye.target_scale_h += punch
 
         # 3. LID MICRO-DROOP — when speech pauses (fast near zero mid-sentence)
@@ -1937,7 +1943,7 @@ try:
 
         # Clean up temporary target mutations so they don't accumulate
         if af > 0.05:
-            left_eye.target_scale_w -= punch * 0.5
+            left_eye.target_scale_w -= punch * 0.10
             left_eye.target_scale_h -= punch
         if udp_speak_pulse > 0.0 and af < 0.025 and sl > 0.015:
             left_eye.target_scale_h += droop
