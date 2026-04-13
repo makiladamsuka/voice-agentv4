@@ -43,6 +43,14 @@ _ALPHA_FAST = 0.6
 _ALPHA_SLOW = 0.05
 _SEND_INTERVAL = 0.040    # 40 ms between UDP sends
 
+# ── Pacing Logic ─────────────────────────────────────────────────────────────
+_audio_buffer = bytearray()
+_pacer_task: asyncio.Task | None = None
+_SAMPLE_RATE = 24000  # Default for Deepgram Aura
+_BYTES_PER_SAMPLE = 2 # 16-bit PCM
+_CHUNK_MS = 40
+_CHUNK_BYTES = int((_SAMPLE_RATE * _BYTES_PER_SAMPLE) * (_CHUNK_MS / 1000))
+
 # ──────────────────────────────────────────────────────────────────────────────
 # UDP sender – fire-and-forget, silently drops on any exception
 # ──────────────────────────────────────────────────────────────────────────────
@@ -68,21 +76,35 @@ def _rms(pcm_bytes: bytes) -> float:
 
 
 def _process_chunk(pcm_bytes: bytes) -> None:
-    """Update the two smoothed amplitude signals from a chunk of raw PCM bytes.
+    """Buffer raw PCM bytes for the pacer loop to consume at 1x real-time."""
+    global _audio_buffer
+    _audio_buffer.extend(pcm_bytes)
+    _ensure_pacer()
+
+async def _pacer_loop() -> None:
+    """Consumes the audio buffer at real-time speed and sends UDP updates."""
+    global _ampl_fast, _ampl_slow, _audio_buffer
     
-    Sends a UDP packet to robot_eyes.py at most every _SEND_INTERVAL seconds.
-    """
-    global _ampl_fast, _ampl_slow, _last_sent
+    while True:
+        start_time = asyncio.get_event_loop().time()
+        
+        # Pull 40ms of audio from the buffer
+        chunk = b""
+        if len(_audio_buffer) >= _CHUNK_BYTES:
+            chunk = bytes(_audio_buffer[:_CHUNK_BYTES])
+            del _audio_buffer[:_CHUNK_BYTES]
+        
+        # Compute RMS or decay toward zero if buffer is empty
+        if chunk:
+            raw = _rms(chunk)
+        else:
+            # Decay signals slightly when no audio is playing to prevent hard snaps
+            raw = 0.0
+            
+        _ampl_fast = _ALPHA_FAST * raw + (1.0 - _ALPHA_FAST) * _ampl_fast
+        _ampl_slow = _ALPHA_SLOW * raw + (1.0 - _ALPHA_SLOW) * _ampl_slow
 
-    raw = _rms(pcm_bytes)
-
-    # Two-speed exponential smoothing
-    _ampl_fast = _ALPHA_FAST * raw + (1.0 - _ALPHA_FAST) * _ampl_fast
-    _ampl_slow = _ALPHA_SLOW * raw + (1.0 - _ALPHA_SLOW) * _ampl_slow
-
-    now = time.monotonic()
-    if now - _last_sent >= _SEND_INTERVAL:
-        _last_sent = now
+        # Always send UDP to keep eyes alive/synced
         try:
             payload = json.dumps({
                 "amplitude_fast": round(_ampl_fast, 4),
@@ -92,10 +114,25 @@ def _process_chunk(pcm_bytes: bytes) -> None:
         except Exception:
             pass
 
+        # Maintain precise 40ms cadence regardless of processing time
+        elapsed = asyncio.get_event_loop().time() - start_time
+        await asyncio.sleep(max(0, (_CHUNK_MS / 1000.0) - elapsed))
+
+def _ensure_pacer() -> None:
+    """Starts the pacer loop task if it's not already running."""
+    global _pacer_task
+    if _pacer_task is None or _pacer_task.done():
+        try:
+            loop = asyncio.get_running_loop()
+            _pacer_task = loop.create_task(_pacer_loop())
+        except RuntimeError:
+            pass # No loop running yet
+
 
 def _drain_to_zero() -> None:
-    """Called when speech ends – decay both signals toward zero and notify eyes."""
-    global _ampl_fast, _ampl_slow, _last_sent
+    """Called when speech ends – clear buffer and decay signals."""
+    global _ampl_fast, _ampl_slow, _audio_buffer
+    _audio_buffer.clear()
     _ampl_fast = 0.0
     _ampl_slow = 0.0
     try:
@@ -182,6 +219,7 @@ class AmplitudeTTS(DeepgramTTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> _TappingChunkedStream:
+        _ensure_pacer()
         return _TappingChunkedStream(tts=self, input_text=text, conn_options=conn_options)
 
     def stream(
@@ -189,6 +227,7 @@ class AmplitudeTTS(DeepgramTTS):
         *,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> _TappingSynthesizeStream:
+        _ensure_pacer()
         stream = _TappingSynthesizeStream(tts=self, conn_options=conn_options)
         self._streams.add(stream)
         return stream
