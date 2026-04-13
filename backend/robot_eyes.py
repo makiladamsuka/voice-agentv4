@@ -86,7 +86,7 @@ MAX_Y_OFFSET = 22
 FACE_ROLL_MULT = 0.0
 FACE_ROLL_MAX_DEG = 10.0
 EYE_BOUND_MARGIN = 8
-MIN_EYE_SCALE = 0.72
+MIN_EYE_SCALE = 0.85
 MAX_EYE_SCALE = 1.28
 MAX_TOP_LID = 0.90
 MAX_BOTTOM_LID = 0.82
@@ -585,8 +585,8 @@ class RoundEye:
                     move_stretch_x *= 0.45
                     move_stretch_y *= 0.45
 
-            k = 0.12
-            d = 0.70
+            k = 0.22
+            d = 0.84
             if self.current_emotion == "surprised":
                 if now < self.surprise_shock_until:
                     k = 0.46
