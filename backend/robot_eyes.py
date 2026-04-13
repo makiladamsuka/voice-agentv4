@@ -1913,7 +1913,7 @@ try:
         # af/sl/da already computed above in section 4
 
         # 1. VERTICAL FLOAT — slow signal lifts eye with speech energy
-        float_y = -sl * 22.0
+        float_y = -sl * 35.0
         left_eye.target_pos[1] -= float_y
 
         # 2. SYLLABLE PUNCH — fast rising spikes widen the eye briefly
@@ -1921,9 +1921,9 @@ try:
         #    Slow gradual swell → eyes open warmly (larger multiplier, same dir)
         if af > 0.05:
             if da > 0.08:                # sharp spike (stressed syllable)
-                punch = da * 0.55        # strong but short
+                punch = da * 0.85        # strong but short
             else:                        # gradual swell
-                punch = af * 0.18        # warm open, tied to energy level
+                punch = af * 0.40        # warm open, tied to energy level
             left_eye.target_scale_w += punch * 0.5
             left_eye.target_scale_h += punch
 

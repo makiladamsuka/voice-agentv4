@@ -39,8 +39,8 @@ from livekit.agents.types import DEFAULT_API_CONNECT_OPTIONS, APIConnectOptions
 _ampl_fast: float = 0.0   # α = 0.6  – tracks individual syllable peaks
 _ampl_slow: float = 0.0   # α = 0.05 – tracks overall speech energy envelope
 
-_ALPHA_FAST = 0.6
-_ALPHA_SLOW = 0.05
+_ALPHA_FAST = 0.85
+_ALPHA_SLOW = 0.12
 _SEND_INTERVAL = 0.040    # 40 ms between UDP sends
 
 # ── Pacing Logic ─────────────────────────────────────────────────────────────
@@ -68,10 +68,10 @@ def _rms(pcm_bytes: bytes) -> float:
     samples = struct.unpack(f"<{n}h", pcm_bytes[:n * 2])
     rms = math.sqrt(sum(s * s for s in samples) / n)
     
-    # Normalise INT16 -> [0, 1] then apply a x4 gain boost
+    # Normalise INT16 -> [0, 1] then apply a x8 gain boost
     # This ensures even quiet speech drives the physical eyes
     normalised = min(rms / 32768.0, 1.0)
-    boosted = min(normalised * 4.0, 1.0)
+    boosted = min(normalised * 8.0, 1.0)
     return boosted
 
 
