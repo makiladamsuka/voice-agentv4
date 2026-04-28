@@ -1576,7 +1576,13 @@ try:
             side_dir_last_switch_ts = now
 
         if face_entered:
-            emotion_force_until = now + EXCITED_BURST_SEC
+            # 35% chance to greet with a smile, otherwise looking "excited" (sharp alert)
+            if random.random() < 0.35:
+                target_emotion_raw = "happy"
+                emotion_force_until = now + 1.2
+            else:
+                target_emotion_raw = "excited"
+                emotion_force_until = now + EXCITED_BURST_SEC
 
         if local_face_present:
             no_face_since_ts = now
@@ -1644,6 +1650,12 @@ try:
                         target_emotion_raw = "curious_intense"
                 else:
                     target_emotion_raw = "idle"
+            elif social_mode == "warm":
+                # FRIENDLY ADDITION: Allow smiling even at normal distances if mode is warm
+                if side_look_active:
+                    target_emotion_raw = "looking_right_happy" if side_right else "looking_left_happy"
+                else:
+                    target_emotion_raw = "happy"
             elif should_squint:
                 target_emotion_raw = "squint"
             else:
