@@ -4,6 +4,7 @@ from tools import TimeTools, SearchTools
 from livekit.agents import Agent, AgentSession, RunContext, function_tool
 from livekit.plugins import openai, deepgram, silero
 from amplitude_tts import AmplitudeTTS, _drain_to_zero
+from text_filters import filter_leaked_tool_syntax
 import os
 import asyncio
 import datetime
@@ -142,8 +143,15 @@ async def entrypoint(ctx: agents.JobContext):
         llm=openai.LLM(
             base_url="https://api.groq.com/openai/v1",
             api_key=os.getenv("GROQ_API_KEY"),
-            model="llama-3.3-70b-versatile"
+            model="llama-3.3-70b-versatile",
+            parallel_tool_calls=True,
+            _strict_tool_schema=False,
         ),
+        tts_text_transforms=[
+            "filter_markdown",
+            "filter_emoji",
+            filter_leaked_tool_syntax,
+        ],
     )
 
     agent = SimpleVoiceAgent()
