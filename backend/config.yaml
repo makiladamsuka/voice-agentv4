@@ -1,0 +1,223 @@
+# Robot eyes tuning — edit values here; restart robot_eyes.py to apply.
+# Phase 3 will add hot-reload for flagged fields.
+
+display:
+  screen_width: 128
+  screen_height: 160
+  eye_color: [255, 255, 255]
+  bg_color: [0, 0, 0]
+  eye_size: 126
+  floor_y_offset: 5  # floor_y = screen_height - this
+
+camera:
+  face_model_path: face_detection_yunet_2023mar.onnx
+  main_res: [1280, 720]
+  detect_res: [640, 360]
+  stream_res: [320, 180]
+  confidence_threshold: 0.6
+  nms_threshold: 0.3
+  rotate_180: true
+  stream_swap_rb: true
+
+stream:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  fps: 8
+  jpeg_quality: 70
+  render_fps: 24
+  vision_fps: 10
+
+eyes:
+  max_x_offset: 30
+  max_y_offset: 22
+  face_roll_mult: 0.0
+  face_roll_max_deg: 10.0
+  eye_bound_margin: 8
+  min_eye_scale: 0.85
+  max_eye_scale: 1.28
+  max_top_lid: 0.90
+  max_bottom_lid: 0.82
+  eye_move_footprint_x: 0.34
+  eye_move_footprint_y: 0.36
+  eye_render_pad_x: 4.0
+  eye_render_pad_y: 6.0
+  eye_motion_clamp_scale: 0.82
+  blink_speed_min: 3.2
+  blink_speed_max: 4.2
+  look_side_offset: 16.0
+  eye_head_ratio: 0.88
+  eye_head_ratio_face: 0.38
+  eye_head_smooth_alpha: 0.14
+  head_eye_pan_sign: 1.0
+  head_eye_tilt_sign: -1.0
+  sleep_tilt_deg: 8.0
+  jerk_amplitude: 9.0
+  jerk_duration: 0.30
+
+debug:
+  emotions: false
+  emotion_reason: false
+  amplitude: false
+
+face_tracking:
+  close_face_enter_ratio: 0.05
+  close_face_exit_ratio: 0.042
+  far_face_area_ratio: 0.018
+  far_squint_chance: 0.08
+  far_squint_min_sec: 0.22
+  far_squint_max_sec: 0.55
+  face_track_emotions:
+    - attentive
+    - engaged
+    - warm
+    - content
+    - curious_intense
+    - amused
+    - thinking
+    - cheerful
+    - happy
+    - idle
+  face_track_default: attentive
+  face_track_intensity: 0.85
+  face_track_smooth_alpha: 0.12
+  face_track_smooth_alpha_idle: 0.15
+  face_track_deadzone_x: 0.06
+  face_track_deadzone_y: 0.07
+  face_track_servo_alpha: 0.38
+  face_present_hold_sec: 0.50
+  face_absent_before_scan_sec: 1.0
+  face_stable_before_track_sec: 0.6
+  face_acquire_snap_alpha: 0.55
+  face_acquire_snap_duration_sec: 0.40
+  face_scan_cooldown_after_lock_sec: 6.0
+  no_face_sleepy_sec: 120.0
+  no_face_bored_sec: 180.0
+  no_face_idle_blend_min_sec: 2.0
+  no_face_idle_blend_max_sec: 3.4
+  no_face_idle_blend_stages: 2
+  no_face_wander_sec: 150.0
+  wander_peek_min_sec: 5.0
+  wander_peek_max_sec: 8.0
+  wander_peek_chance: 0.85
+  wander_search_pan_amp_deg: 18.0
+  wander_search_tilt_amp_deg: 12.0
+  wander_search_period_sec: 14.0
+  wander_search_tilt_phase_k: 1.3
+  sad_return_sec: 10.0
+  sad_nod_tilt_deg: 10.0
+  sad_nod_count: 2.0
+  no_face_sad_recenter_alpha: 0.12
+  wander_emotions:
+    - curious_intense
+    - uncertain
+    - thinking
+    - attentive
+    - curious
+  settled_sleepy_variety_min_sec: 20.0
+  settled_sleepy_variety_max_sec: 40.0
+  no_face_idle_pan_deg: 14.0
+  no_face_idle_tilt_deg: 10.0
+  no_face_idle_eye_x: 8.0
+  no_face_idle_eye_y: 10.0
+  chat_ready_recenter_alpha: 0.18
+  chat_ready_min_sec: 120.0
+  wake_tilt_jerk_deg: 12.0
+  wake_tilt_jerk_sec: 0.35
+  wake_surprise_sec: 0.35
+  awake_conv_prev: [waiting, awkward]
+  awake_conv_active: [listening, speaking, thinking]
+  no_face_recenter_sec: 1.5
+  no_face_recenter_alpha: 0.06
+
+emotion:
+  min_hold_sec: 0.70
+  speak_hold_sec: 0.45
+  switch_cooldown_sec: 0.35
+  excited_burst_sec: 0.65
+  router_stable_sec: 0.12
+  side_look_enter_offset: 7.0
+  side_look_exit_offset: 4.5
+  side_look_switch_cooldown_sec: 0.22
+  multi_face_debounce_sec: 0.16
+  jerk_cooldown_sec: 0.60
+  social_mode_min_sec: 0.70
+  social_mode_max_sec: 2.00
+  happy_min_gap_sec: 2.80
+  speak_emotions:
+    - engaged
+    - excited
+    - cheerful
+    - amused
+    - warm
+    - happy
+    - content
+  speak_social_min_sec: 0.80
+  speak_social_max_sec: 1.20
+  connected_solo_emotions:
+    - cheerful
+    - happy
+    - content
+    - warm
+    - engaged
+    - excited
+  lazy_emotions: [sleepy, bored, idle, awkward]
+
+gaze:
+  lock_after_face_sec: 3.0
+  min_gap_min_sec: 4.0
+  min_gap_max_sec: 6.0
+  ambient_scan_min_sec: 8.0
+  ambient_scan_max_sec: 15.0
+  no_face_search_min_scans: 3
+  no_face_scan_trigger_chance: 0.55
+  no_face_scan_retry_min_sec: 3.0
+  no_face_scan_retry_max_sec: 7.0
+  no_face_scan_servo_pan_deg: 12.0
+  no_face_scan_servo_tilt_deg: 10.0
+  no_face_scan_tilt_phase: 0.35
+  solo_upbeat_min_sec: 25.0
+  social_release_min_sec: 20.0
+  social_release_max_sec: 30.0
+  brief_x: 12.0
+  brief_y: 7.0
+  think_x: 18.0
+  think_y: 12.0
+  scan_x: 24.0
+  scan_y: 11.0
+  release_x: 18.0
+  release_y: 6.0
+  servo_pan_per_px: 0.14
+  servo_tilt_per_px: 0.12
+
+servo:
+  enabled: true
+  pan_ch: 0
+  tilt_ch: 1
+  pan_min: 40.0
+  pan_max: 130.0
+  tilt_min: 80.0
+  tilt_max: 130.0
+  pulse_min: 450
+  pulse_max: 2600
+  smoothing: 0.10
+  loop_delay: 0.01
+  max_step_deg: 1.4
+  deadzone_deg: 0.22
+  pan_track_range: 26.0
+  tilt_track_range: 24.0
+  target_filter_alpha: 0.30
+  track_damp_alpha_scale: 0.40
+  track_damp_slow_thresh: 0.02
+  track_damp_fast_thresh: 0.008
+  conv_nod_deg: 6.0
+  conv_nod_hz: 5.5
+  conv_think_bob_deg: 3.0
+  conv_think_bob_hz: 2.2
+  talk_nod_tilt_mult: 10.0
+  talk_sway_pan_mult: 7.5
+  talk_gesture_pan_mult: 0.0
+  talk_gesture_tilt_mult_face: 10.0
+  talk_gesture_tilt_mult_no_face: 10.0
+  face_talk_punch_scale: 0.45
+  face_talk_af_thresh: 0.04

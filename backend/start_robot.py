@@ -16,6 +16,7 @@ def start_services():
 
     # 2. Start the eyes and face tracking service
     print("👀 Starting TFT Eyes & Face Tracker out-of-process...")
+    print("   Debug dashboard: http://<pi-ip>:8080/debug")
     eyes_proc = subprocess.Popen([sys.executable, "robot_eyes.py"])
     
     try:

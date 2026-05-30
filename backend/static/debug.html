@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Robot Debug Dashboard</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --panel: #1a1d27;
+      --border: #2a2f3d;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --accent: #6ea8fe;
+      --ok: #3dd68c;
+      --warn: #f5a623;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    header {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    header h1 { font-size: 16px; font-weight: 600; }
+    #status-bar { color: var(--muted); font-size: 12px; }
+    #status-bar.error { color: #ff6b6b; }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      padding: 12px;
+    }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .panel-wide { grid-column: 1 / -1; }
+    .panel h2 {
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      padding: 8px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .panel-body { padding: 10px 12px; }
+    .camera-wrap {
+      background: #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 180px;
+    }
+    .camera-wrap img {
+      max-width: 100%;
+      height: auto;
+      display: block;
+    }
+    dl {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 12px;
+    }
+    dt { color: var(--muted); }
+    dd { word-break: break-word; }
+    .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      background: var(--border);
+      font-size: 11px;
+    }
+    .badge.on { background: #1e3a2f; color: var(--ok); }
+    .badge.off { background: #3a1e1e; color: #ff8a8a; }
+    .trace {
+      margin-top: 8px;
+      padding: 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      font-size: 11px;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .trace div { padding: 1px 0; color: var(--muted); }
+    .bar-wrap { margin-top: 6px; }
+    .bar-label { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); }
+    .bar {
+      height: 6px;
+      background: var(--bg);
+      border-radius: 3px;
+      margin-top: 2px;
+      overflow: hidden;
+    }
+    .bar-fill {
+      height: 100%;
+      background: var(--accent);
+      border-radius: 3px;
+      transition: width 0.15s;
+    }
+    .bar-fill.slow { background: #a78bfa; }
+    details { margin-top: 4px; }
+    summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+    pre.config-tree {
+      margin-top: 8px;
+      padding: 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      font-size: 11px;
+      max-height: 400px;
+      overflow: auto;
+      white-space: pre-wrap;
+    }
+    .tuning-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .tuning-row label { color: var(--muted); font-size: 11px; }
+    .tuning-row input[type=range] { width: 100%; accent-color: var(--accent); }
+    .tuning-val { color: var(--text); min-width: 48px; text-align: right; font-size: 11px; }
+    .btn-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+    button {
+      background: var(--border);
+      color: var(--text);
+      border: 1px solid #3d4455;
+      border-radius: 5px;
+      padding: 5px 10px;
+      font-size: 11px;
+      cursor: pointer;
+      font-family: inherit;
+    }
+    button:hover { background: #3d4455; }
+    button.primary { background: #1e3a5f; border-color: var(--accent); color: var(--accent); }
+    button.primary:hover { background: #264a73; }
+    #action-msg { margin-top: 8px; font-size: 11px; color: var(--muted); }
+    #action-msg.error { color: #ff6b6b; }
+    #action-msg.ok { color: var(--ok); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Robot Debug Dashboard</h1>
+    <div id="status-bar">Connecting...</div>
+  </header>
+
+  <div class="grid">
+    <section class="panel panel-wide">
+      <h2>Camera</h2>
+      <div class="camera-wrap">
+        <img src="/stream" alt="Camera stream">
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Emotion</h2>
+      <div class="panel-body" id="emotion-panel">—</div>
+    </section>
+
+    <section class="panel">
+      <h2>Voice / UDP</h2>
+      <div class="panel-body" id="udp-panel">—</div>
+    </section>
+
+    <section class="panel">
+      <h2>Face Tracking</h2>
+      <div class="panel-body" id="face-panel">—</div>
+    </section>
+
+    <section class="panel">
+      <h2>Servo</h2>
+      <div class="panel-body" id="servo-panel">—</div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Live Tuning</h2>
+      <div class="panel-body">
+        <div id="tuning-sliders"></div>
+        <div class="btn-row">
+          <button class="primary" id="btn-save-config">Save to config.yaml</button>
+        </div>
+        <div id="action-msg"></div>
+      </div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Manual Controls</h2>
+      <div class="panel-body">
+        <p style="color:var(--muted);font-size:11px;margin-bottom:8px">Trigger states without voice — for eye tuning.</p>
+        <div class="btn-row">
+          <button data-trigger='{"action":"wake"}'>Wake</button>
+          <button data-trigger='{"action":"conv_state","state":"listening","emotion":"excited"}'>Listening</button>
+          <button data-trigger='{"action":"conv_state","state":"thinking","emotion":"thinking"}'>Thinking</button>
+          <button data-trigger='{"action":"conv_state","state":"speaking","emotion":"engaged"}'>Speaking</button>
+          <button data-trigger='{"action":"conv_state","state":"waiting","emotion":"attentive"}'>Waiting</button>
+          <button data-trigger='{"action":"speaking","amplitude_fast":0.5,"amplitude_slow":0.4}'>Simulate talk</button>
+        </div>
+        <div class="btn-row">
+          <button data-trigger='{"action":"emotion","emotion":"happy"}'>Happy</button>
+          <button data-trigger='{"action":"emotion","emotion":"sad"}'>Sad</button>
+          <button data-trigger='{"action":"emotion","emotion":"surprised"}'>Surprised</button>
+          <button data-trigger='{"action":"emotion","emotion":"sleepy"}'>Sleepy</button>
+          <button data-trigger='{"action":"emotion","emotion":"thinking"}'>Thinking face</button>
+          <button data-trigger='{"action":"emotion","emotion":"excited"}'>Excited</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>Config</h2>
+      <div class="panel-body">
+        <details>
+          <summary>Show full config.yaml values</summary>
+          <pre class="config-tree" id="config-tree">Loading...</pre>
+        </details>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const statusBar = document.getElementById("status-bar");
+    const actionMsg = document.getElementById("action-msg");
+    let tuningFields = [];
+    let patchTimer = null;
+
+    function showAction(msg, ok = true) {
+      actionMsg.textContent = msg;
+      actionMsg.className = ok ? "ok" : "error";
+    }
+
+    function badge(val, onLabel = "yes", offLabel = "no") {
+      const on = !!val;
+      return `<span class="badge ${on ? "on" : "off"}">${on ? onLabel : offLabel}</span>`;
+    }
+
+    function bar(label, value, cls = "") {
+      const pct = Math.min(100, Math.max(0, value * 100));
+      return `<div class="bar-wrap">
+        <div class="bar-label"><span>${label}</span><span>${value.toFixed(3)}</span></div>
+        <div class="bar"><div class="bar-fill ${cls}" style="width:${pct}%"></div></div>
+      </div>`;
+    }
+
+    function renderState(s) {
+      document.getElementById("emotion-panel").innerHTML = `
+        <dl>
+          <dt>Current</dt><dd><strong>${s.emotion.current}</strong></dd>
+          <dt>Candidate</dt><dd>${s.emotion.candidate}</dd>
+          <dt>No-face mode</dt><dd>${s.emotion.no_face_mode}</dd>
+          <dt>Gaze state</dt><dd>${s.emotion.gaze_state}</dd>
+          <dt>Social mode</dt><dd>${s.emotion.social_mode}</dd>
+          <dt>Speak social</dt><dd>${s.emotion.speak_social_mode}</dd>
+          <dt>Session</dt><dd>${badge(s.session_active, "active", "idle")}</dd>
+        </dl>
+        <div class="trace">${s.emotion.trace.length
+          ? s.emotion.trace.map(t => `<div>${t}</div>`).join("")
+          : "<div>(no trace yet)</div>"}</div>`;
+
+      document.getElementById("udp-panel").innerHTML = `
+        <dl>
+          <dt>Conv state</dt><dd>${s.udp.conv_state}</dd>
+          <dt>Conv emotion</dt><dd>${s.udp.conv_emotion}</dd>
+          <dt>VADER override</dt><dd>${s.udp.emotion_override ?? "—"}</dd>
+          <dt>Override TTL</dt><dd>${s.udp.emotion_override_remaining}s</dd>
+        </dl>
+        ${bar("Amplitude fast", s.udp.amplitude_fast)}
+        ${bar("Amplitude slow", s.udp.amplitude_slow, "slow")}
+        ${bar("Speak pulse", s.udp.speak_pulse)}`;
+
+      document.getElementById("face-panel").innerHTML = `
+        <dl>
+          <dt>Face present</dt><dd>${badge(s.face.present)}</dd>
+          <dt>Face count</dt><dd>${s.face.count}</dd>
+          <dt>Area ratio</dt><dd>${s.face.area_ratio}</dd>
+          <dt>Eye offset X/Y</dt><dd>${s.face.x_offset} / ${s.face.y_offset}</dd>
+          <dt>Rotation</dt><dd>${s.face.rotation}</dd>
+          <dt>Tracking</dt><dd>${badge(s.face.tracking_active)}</dd>
+        </dl>`;
+
+      document.getElementById("servo-panel").innerHTML = `
+        <dl>
+          <dt>Enabled</dt><dd>${badge(s.servo.enabled)}</dd>
+          <dt>Pan</dt><dd>${s.servo.pan}° (target ${s.servo.target_pan}°)</dd>
+          <dt>Tilt</dt><dd>${s.servo.tilt}° (target ${s.servo.target_tilt}°)</dd>
+        </dl>`;
+    }
+
+    function renderTuningSliders() {
+      const container = document.getElementById("tuning-sliders");
+      container.innerHTML = tuningFields.map((f, i) => `
+        <div class="tuning-row">
+          <div>
+            <label for="tune-${i}">${f.label}</label>
+            <input type="range" id="tune-${i}" min="${f.min}" max="${f.max}" step="${f.step}" value="${f.value}"
+              data-path="${f.path}">
+          </div>
+          <span class="tuning-val" id="tune-val-${i}">${Number(f.value).toFixed(3)}</span>
+        </div>`).join("");
+
+      container.querySelectorAll("input[type=range]").forEach((input, i) => {
+        input.addEventListener("input", () => {
+          document.getElementById(`tune-val-${i}`).textContent = Number(input.value).toFixed(3);
+          clearTimeout(patchTimer);
+          patchTimer = setTimeout(() => {
+            const step = parseFloat(input.step);
+            const raw = step >= 1 && Number.isInteger(step) ? parseInt(input.value, 10) : parseFloat(input.value);
+            patchConfig([{ path: input.dataset.path, value: raw }]);
+          }, 120);
+        });
+      });
+    }
+
+    async function patchConfig(patches, save = false) {
+      try {
+        const res = await fetch("/api/config", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ patches, save }),
+        });
+        const data = await res.json();
+        if (!data.ok) {
+          showAction(data.errors?.join(", ") || "Patch failed", false);
+          return data;
+        }
+        if (save) showAction(`Saved to ${data.saved}`, true);
+        else showAction("Applied live", true);
+        document.getElementById("config-tree").textContent = JSON.stringify(data.config, null, 2);
+        return data;
+      } catch (err) {
+        showAction(err.message, false);
+      }
+    }
+
+    async function triggerAction(payload) {
+      try {
+        const res = await fetch("/api/trigger", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        showAction(data.ok ? `Triggered: ${payload.action}` : (data.error || "Failed"), data.ok);
+      } catch (err) {
+        showAction(err.message, false);
+      }
+    }
+
+    async function pollState() {
+      try {
+        const res = await fetch("/api/state");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderState(data);
+        const ts = new Date(data.timestamp * 1000).toLocaleTimeString();
+        statusBar.textContent = `Live · updated ${ts}`;
+        statusBar.classList.remove("error");
+      } catch (err) {
+        statusBar.textContent = `Poll error: ${err.message}`;
+        statusBar.classList.add("error");
+      }
+    }
+
+    async function loadConfig() {
+      try {
+        const res = await fetch("/api/config");
+        if (!res.ok) return;
+        const data = await res.json();
+        document.getElementById("config-tree").textContent = JSON.stringify(data, null, 2);
+      } catch (_) {}
+    }
+
+    async function loadTuning() {
+      try {
+        const res = await fetch("/api/tuning");
+        if (!res.ok) return;
+        const data = await res.json();
+        tuningFields = data.fields || [];
+        renderTuningSliders();
+      } catch (_) {}
+    }
+
+    document.querySelectorAll("[data-trigger]").forEach(btn => {
+      btn.addEventListener("click", () => triggerAction(JSON.parse(btn.dataset.trigger)));
+    });
+
+    document.getElementById("btn-save-config").addEventListener("click", async () => {
+      await patchConfig([], true);
+    });
+
+    loadTuning();
+    loadConfig();
+    pollState();
+    setInterval(pollState, 500);
+  </script>
+</body>
+</html>

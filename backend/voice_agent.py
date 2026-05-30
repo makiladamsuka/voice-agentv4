@@ -93,11 +93,16 @@ async def _thinking_cycle(word_count: int):
         await asyncio.sleep(3.0)
         _set_conv_state("remembering", "remembering")
 
+_session_live = False
+
+
 async def _awkward_timer():
-    """Timer that triggers 'awkward' after 5s of silence."""
+    """After silence, nudge waiting emotion (cheerful while session is live)."""
     await asyncio.sleep(5.0)
-    _udp({"command": "conv_state", "state": "waiting", "emotion": "awkward"})
-    print("😶 [ConvState L2] Situation is getting AWKWARD...")
+    if not _session_live:
+        return
+    _udp({"command": "conv_state", "state": "waiting", "emotion": "cheerful"})
+    print("👁  [ConvState L2] Long pause -> waiting (cheerful)")
 
 def _set_conv_state(state: str, emotion: str | None = None):
     """Send a conversation state packet. Cancels active timers."""
@@ -127,7 +132,7 @@ class SimpleVoiceAgent(Agent, TimeTools, SearchTools):
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
 
 async def entrypoint(ctx: agents.JobContext):
-    global _thinking_task, _awkward_timer_task, _smart_wait_task
+    global _thinking_task, _awkward_timer_task, _smart_wait_task, _session_live
 
     session = AgentSession(
         turn_handling=agents.TurnHandlingOptions(
@@ -157,11 +162,14 @@ async def entrypoint(ctx: agents.JobContext):
     agent = SimpleVoiceAgent()
     print("🚀 Starting LiveKit session...")
     await session.start(room=ctx.room, agent=agent)
+    _session_live = True
+    _udp({"command": "session_active", "active": True})
     await session.say("Oh hi! I am so happy you are talking to me!")
 
     # ── State 1: LISTENING / WAITING (Precise VAD) ───────────────────────────
     async def _hearing_reflex():
         """Stage 1: The 'Startle' — robot perks up when hearing voice."""
+        _udp({"command": "wake"})
         # Pulse to excited immediately to show hearing
         _udp({"command": "conv_state", "state": "listening", "emotion": "excited"})
         await asyncio.sleep(0.4)
@@ -182,11 +190,6 @@ async def entrypoint(ctx: agents.JobContext):
             if ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
                 # If we aren't thinking/speaking yet, go back to waiting
                 _set_conv_state("waiting", "attentive")
-        
-        # Start awkward countdown
-        if _awkward_timer_task and not _awkward_timer_task.done():
-            _awkward_timer_task.cancel()
-        _awkward_timer_task = asyncio.create_task(_awkward_timer())
         
         # Clean up existing smart wait and start a new one
         if _smart_wait_task and not _smart_wait_task.done():
@@ -235,14 +238,14 @@ async def entrypoint(ctx: agents.JobContext):
         global _awkward_timer_task
         _drain_to_zero()
         _set_conv_state("waiting", "attentive")
-        if _awkward_timer_task and not _awkward_timer_task.done():
-            _awkward_timer_task.cancel()
-        _awkward_timer_task = asyncio.create_task(_awkward_timer())
-
 
     # Keeps session alive
-    while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
-        await asyncio.sleep(1)
+    try:
+        while ctx.room.connection_state == rtc.ConnectionState.CONN_CONNECTED:
+            await asyncio.sleep(1)
+    finally:
+        _session_live = False
+        _udp({"command": "session_active", "active": False})
 
 if __name__ == "__main__":
     from livekit.agents import WorkerOptions, cli
