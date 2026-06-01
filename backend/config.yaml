@@ -192,6 +192,11 @@ gaze:
 
 servo:
   enabled: true
+  backend: arduino
+  arduino_port: ""
+  arduino_baud: 115200
+  arduino_pan_pin: 9
+  arduino_tilt_pin: 10
   pan_ch: 0
   tilt_ch: 1
   pan_min: 40.0
@@ -221,3 +226,10 @@ servo:
   talk_gesture_tilt_mult_no_face: 10.0
   face_talk_punch_scale: 0.45
   face_talk_af_thresh: 0.04
+
+base:
+  enabled: true
+  # Set by: python test_base_motor.py --calibrate-manual --degrees 90 --write-config
+  counts_per_degree: 37.855556  # set by --calibrate-manual
+  max_relative_deg: 180.0
+  move_timeout_sec: 15.0

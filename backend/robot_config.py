@@ -235,6 +235,11 @@ class GazeConfig:
 @dataclass
 class ServoConfig:
     enabled: bool = True
+    backend: str = "arduino"
+    arduino_port: str = ""
+    arduino_baud: int = 115200
+    arduino_pan_pin: int = 9
+    arduino_tilt_pin: int = 10
     pan_ch: int = 0
     tilt_ch: int = 1
     pan_min: float = 40.0
@@ -267,6 +272,14 @@ class ServoConfig:
 
 
 @dataclass
+class BaseConfig:
+    enabled: bool = True
+    counts_per_degree: float = 1.0
+    max_relative_deg: float = 180.0
+    move_timeout_sec: float = 15.0
+
+
+@dataclass
 class RobotConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -277,6 +290,7 @@ class RobotConfig:
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     gaze: GazeConfig = field(default_factory=GazeConfig)
     servo: ServoConfig = field(default_factory=ServoConfig)
+    base: BaseConfig = field(default_factory=BaseConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

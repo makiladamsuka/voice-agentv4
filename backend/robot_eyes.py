@@ -3,7 +3,7 @@
 Face Tracking Eyes for Dual SPI Displays (Picamera2)
 Combines face tracking (YuNet) with dual SPI display output (ST7735).
 
-Optional: ServoKit pan/tilt face following (non-PID smoothing).
+Optional: ServoKit (I2C) or Arduino Nano (USB) pan/tilt face following.
 """
 
 import time
@@ -27,6 +27,7 @@ from robot_config import (
     patch_config,
     save_config,
 )
+from servo_driver import create_servo_driver
 
 # Shared amplitude state written by the UDP thread, read by the render loop
 udp_emotion_override = None
@@ -1417,7 +1418,7 @@ squint_until = 0.0
 servo_state_lock = threading.Lock()
 servo_running = False
 servo_thread = None
-servo_kit = None
+servo_driver = None
 servo_target_pan = (PAN_MIN + PAN_MAX) * 0.5
 servo_target_tilt = (TILT_MIN + TILT_MAX) * 0.5
 servo_current_pan = servo_target_pan
@@ -1703,7 +1704,7 @@ def servo_worker():
     global servo_current_pan, servo_current_tilt, servo_running, jerk_until, jerk_direction
     global amplitude_fast, amplitude_slow, udp_speak_pulse, udp_conv_state
     global current_emotion, gaze_event_active, no_face_mode, sad_return_start, wake_tilt_jerk_until
-    if servo_kit is None:
+    if servo_driver is None:
         return
 
     while servo_running:
@@ -1787,11 +1788,7 @@ def servo_worker():
         pan_current = clamp(pan_current + pan_step, PAN_MIN, PAN_MAX)
         tilt_current = clamp(tilt_current + tilt_step, TILT_MIN, TILT_MAX)
 
-        try:
-            servo_kit.servo[PAN_CH].angle = pan_current
-            servo_kit.servo[TILT_CH].angle = tilt_current
-        except Exception as e:
-            print(f"Servo write error: {e}")
+        servo_driver.write_angles(pan_current, tilt_current)
 
         with servo_state_lock:
             servo_current_pan = pan_current
@@ -1881,6 +1878,7 @@ def get_runtime_state() -> dict:
     with servo_state_lock:
         servo = {
             "enabled": ENABLE_SERVO,
+            "backend": cfg.servo.backend,
             "pan": round(servo_current_pan, 2),
             "tilt": round(servo_current_tilt, 2),
             "target_pan": round(servo_target_pan, 2),
@@ -2051,7 +2049,7 @@ def vision_worker():
                     local_x = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, norm_x * MAX_X_OFFSET))
                     local_y = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, norm_y * MAX_Y_OFFSET))
 
-                    if ENABLE_SERVO and servo_kit is not None:
+                    if ENABLE_SERVO and servo_driver is not None:
                         pan_center = (PAN_MIN + PAN_MAX) * 0.5
                         tilt_center = (TILT_MIN + TILT_MAX) * 0.5
                         mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
@@ -2110,7 +2108,7 @@ def vision_worker():
                         local_x = NO_FACE_IDLE_EYE_X
                         local_y = NO_FACE_IDLE_EYE_Y
 
-                if ENABLE_SERVO and servo_kit is not None and not face_locked:
+                if ENABLE_SERVO and servo_driver is not None and not face_locked:
                     pan_center = (PAN_MIN + PAN_MAX) * 0.5
                     tilt_center = (TILT_MIN + TILT_MAX) * 0.5
                     pan_idle = clamp(
@@ -2198,24 +2196,13 @@ print("Starting Tracking Loop...")
 time.sleep(1.0) # Warmup
 
 if ENABLE_SERVO:
-    if ServoKit is None:
-        print("ServoKit not installed; running eyes-only mode.")
+    servo_driver = create_servo_driver(cfg)
+    if servo_driver is not None:
+        servo_running = True
+        servo_thread = threading.Thread(target=servo_worker, daemon=True)
+        servo_thread.start()
     else:
-        try:
-            print("Initializing ServoKit...")
-            servo_kit = ServoKit(channels=16)
-            servo_kit.servo[PAN_CH].set_pulse_width_range(PULSE_MIN, PULSE_MAX)
-            servo_kit.servo[TILT_CH].set_pulse_width_range(PULSE_MIN, PULSE_MAX)
-            servo_kit.servo[PAN_CH].angle = servo_current_pan
-            servo_kit.servo[TILT_CH].angle = servo_current_tilt
-            servo_running = True
-            servo_thread = threading.Thread(target=servo_worker, daemon=True)
-            servo_thread.start()
-            print("Servo tracking enabled.")
-        except Exception as e:
-            print(f"Servo init failed, continuing eyes-only: {e}")
-            servo_kit = None
-            servo_running = False
+        print("Head servo driver unavailable; running eyes-only mode.")
 
 if STREAM_ENABLED:
     try:
@@ -3030,13 +3017,8 @@ finally:
         servo_running = False
         servo_thread.join(timeout=1.0)
 
-    if servo_kit is not None:
-        try:
-            servo_kit.servo[PAN_CH].angle = None
-            servo_kit.servo[TILT_CH].angle = None
-            print("Servos relaxed.")
-        except Exception as e:
-            print(e)
+    if servo_driver is not None:
+        servo_driver.close()
 
     # Cleanup attributes
     try:
