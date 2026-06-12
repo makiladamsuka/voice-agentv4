@@ -235,8 +235,11 @@ class GazeConfig:
 @dataclass
 class ServoConfig:
     enabled: bool = True
-    pan_ch: int = 0
-    tilt_ch: int = 1
+    backend: str = "arduino"
+    arduino_port: str = ""
+    arduino_baud: int = 115200
+    pan_ch: int = 4
+    tilt_ch: int = 5
     pan_min: float = 40.0
     pan_max: float = 130.0
     tilt_min: float = 80.0
@@ -267,6 +270,27 @@ class ServoConfig:
 
 
 @dataclass
+class BaseConfig:
+    enabled: bool = True
+    counts_per_degree: float = 1.0
+    max_relative_deg: float = 180.0
+    move_timeout_sec: float = 15.0
+
+
+@dataclass
+class TofConfig:
+    enabled: bool = True
+    poll_hz: float = 5.0
+    min_valid_mm: float = 30.0
+    present_max_mm: float = 1500.0
+    absent_min_mm: float = 2000.0
+    debounce_present_sec: float = 0.25
+    debounce_absent_sec: float = 0.5
+    labels: list[str] = field(default_factory=lambda: ["left", "center", "right"])
+    mux_channels: list[int] = field(default_factory=lambda: [0, 1, 2])
+
+
+@dataclass
 class RobotConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -277,6 +301,8 @@ class RobotConfig:
     emotion: EmotionConfig = field(default_factory=EmotionConfig)
     gaze: GazeConfig = field(default_factory=GazeConfig)
     servo: ServoConfig = field(default_factory=ServoConfig)
+    base: BaseConfig = field(default_factory=BaseConfig)
+    tof: TofConfig = field(default_factory=TofConfig)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ToF Distance Radar</title>
+  <style>
+    :root {
+      --bg: #0a0e14;
+      --panel: #141a22;
+      --border: #243044;
+      --text: #e6edf3;
+      --muted: #7d8da6;
+      --center: #58a6ff;
+      --left: #3dd68c;
+      --right: #f5a623;
+      --invalid: #4a5568;
+      --grid: #1e2a3a;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      justify-content: space-between;
+    }
+    header h1 { font-size: 18px; font-weight: 600; }
+    #status { font-size: 13px; color: var(--muted); }
+    #status.ok { color: #3dd68c; }
+    #status.err { color: #ff6b6b; }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+      padding: 16px;
+      display: grid;
+      gap: 16px;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .panel h2 {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      padding: 10px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: radial-gradient(circle at 50% 88%, #0f1620 0%, #0a0e14 70%);
+    }
+    .readings {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      padding: 14px;
+    }
+    @media (max-width: 560px) {
+      .readings { grid-template-columns: 1fr; }
+    }
+    .sensor-card {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+      border-top: 3px solid var(--invalid);
+    }
+    .sensor-card.valid { border-top-color: var(--accent, #58a6ff); }
+    .sensor-card.left.valid { border-top-color: var(--left); }
+    .sensor-card.center.valid { border-top-color: var(--center); }
+    .sensor-card.right.valid { border-top-color: var(--right); }
+    .sensor-card .label {
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .sensor-card .angle { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .sensor-card .mm {
+      font-size: 28px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      margin-top: 6px;
+    }
+    .sensor-card .mm.invalid { color: var(--muted); font-size: 20px; }
+    .hint {
+      padding: 0 14px 14px;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ToF distance radar</h1>
+    <div id="status">Connecting…</div>
+  </header>
+  <main>
+    <section class="panel">
+      <h2>Top-down view — robot at bottom, sensors ±45° from front</h2>
+      <canvas id="radar" width="800" height="560"></canvas>
+      <p class="hint">
+        Beams show measured range along each sensor axis. No target = dashed line at 200 mm
+        (readings below 200 mm are ignored). Rings at 200 / 500 / 1000 / 1500 / 2000 mm.
+      </p>
+    </section>
+    <section class="panel">
+      <h2>Readings</h2>
+      <div class="readings">
+        <div class="sensor-card left" id="card-left">
+          <div class="label">Left</div>
+          <div class="angle">45° left of front</div>
+          <div class="mm invalid" id="mm-left">—</div>
+        </div>
+        <div class="sensor-card center" id="card-center">
+          <div class="label">Center</div>
+          <div class="angle">Front (0°)</div>
+          <div class="mm invalid" id="mm-center">—</div>
+        </div>
+        <div class="sensor-card right" id="card-right">
+          <div class="label">Right</div>
+          <div class="angle">45° right of front</div>
+          <div class="mm invalid" id="mm-right">—</div>
+        </div>
+      </div>
+    </section>
+  </main>
+  <script>
+    const MAX_MM = 2000;
+    const CLEAR_BEAM_MM = 200;
+    const FOV_DEG = 25;
+    const SENSOR_AZIMUTH_DEG = { left: -45, center: 0, right: 45 };
+
+    const canvas = document.getElementById("radar");
+    const ctx = canvas.getContext("2d");
+    const statusEl = document.getElementById("status");
+
+    function mmLabel(mm, valid) {
+      if (!valid || mm < 0) return "clear";
+      return `${mm} mm`;
+    }
+
+    function updateCards(data) {
+      for (const key of ["left", "center", "right"]) {
+        const mm = data[`${key}_mm`];
+        const valid = data[`${key}_valid`];
+        const card = document.getElementById(`card-${key}`);
+        const el = document.getElementById(`mm-${key}`);
+        card.classList.toggle("valid", valid);
+        el.classList.toggle("invalid", !valid);
+        el.textContent = mmLabel(mm, valid);
+      }
+    }
+
+    function drawRadar(data) {
+      const w = canvas.width;
+      const h = canvas.height;
+      const cx = w / 2;
+      const cy = h - 52;
+      const scale = (h - 90) / MAX_MM;
+
+      ctx.clearRect(0, 0, w, h);
+
+      // Range rings
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue("--grid").trim();
+      ctx.lineWidth = 1;
+      for (const rMm of [200, 500, 1000, 1500, 2000]) {
+        const r = rMm * scale;
+        ctx.beginPath();
+        ctx.arc(cx, cy, r, Math.PI, 0, false);
+        ctx.stroke();
+        ctx.fillStyle = "#7d8da6";
+        ctx.font = "11px sans-serif";
+        ctx.fillText(`${rMm}`, cx + r + 4, cy - 2);
+      }
+
+      // Forward axis
+      ctx.strokeStyle = "#243044";
+      ctx.setLineDash([4, 6]);
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx, 24);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // Robot body
+      ctx.fillStyle = "#243044";
+      ctx.beginPath();
+      ctx.moveTo(cx, cy + 8);
+      ctx.lineTo(cx - 22, cy + 36);
+      ctx.lineTo(cx + 22, cy + 36);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = "#58a6ff";
+      ctx.beginPath();
+      ctx.arc(cx, cy + 18, 6, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = "#7d8da6";
+      ctx.font = "12px sans-serif";
+      ctx.textAlign = "center";
+      ctx.fillText("robot", cx, cy + 48);
+
+      const colors = { left: "#3dd68c", center: "#58a6ff", right: "#f5a623" };
+
+      for (const key of ["left", "center", "right"]) {
+        const azDeg = SENSOR_AZIMUTH_DEG[key];
+        const az = (-90 + azDeg) * (Math.PI / 180);
+        const mm = data[`${key}_mm`];
+        const valid = data[`${key}_valid`];
+        const color = colors[key];
+
+        // FOV wedge
+        const halfFov = (FOV_DEG / 2) * (Math.PI / 180);
+        const wedgeR = MAX_MM * scale;
+        ctx.fillStyle = color + "18";
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.arc(cx, cy, wedgeR, az - halfFov, az + halfFov, false);
+        ctx.closePath();
+        ctx.fill();
+
+        const hasReading = valid && mm >= 0;
+        const dist = hasReading ? Math.min(mm, MAX_MM) : CLEAR_BEAM_MM;
+        const len = dist * scale;
+        const ex = cx + Math.cos(az) * len;
+        const ey = cy + Math.sin(az) * len;
+
+        ctx.strokeStyle = color;
+        ctx.lineWidth = valid ? 3 : 2;
+        ctx.setLineDash(valid ? [] : [8, 8]);
+        ctx.globalAlpha = valid ? 1 : 0.45;
+        ctx.beginPath();
+        ctx.moveTo(cx, cy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.globalAlpha = 1;
+
+        if (valid) {
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(ex, ey, 9, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = "#0a0e14";
+          ctx.beginPath();
+          ctx.arc(ex, ey, 4, 0, Math.PI * 2);
+          ctx.fill();
+        }
+
+        const labelR = Math.min(len + 28, wedgeR - 10);
+        const lx = cx + Math.cos(az) * labelR;
+        const ly = cy + Math.sin(az) * labelR;
+        ctx.fillStyle = color;
+        ctx.font = "bold 13px sans-serif";
+        ctx.textAlign = "center";
+        ctx.fillText(key[0].toUpperCase() + key.slice(1), lx, ly - 6);
+        ctx.font = "12px sans-serif";
+        ctx.fillStyle = "#e6edf3";
+        ctx.fillText(mmLabel(mm, valid), lx, ly + 10);
+      }
+    }
+
+    async function poll() {
+      try {
+        const res = await fetch("/api/tof");
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        statusEl.textContent = `Live · ${new Date(data.timestamp * 1000).toLocaleTimeString()}`;
+        statusEl.className = "ok";
+        updateCards(data);
+        drawRadar(data);
+      } catch (e) {
+        statusEl.textContent = `Offline — ${e.message}`;
+        statusEl.className = "err";
+      }
+    }
+
+    setInterval(poll, 150);
+    poll();
+  </script>
+</body>
+</html>

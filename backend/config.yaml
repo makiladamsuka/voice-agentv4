@@ -192,8 +192,11 @@ gaze:
 
 servo:
   enabled: true
-  pan_ch: 0
-  tilt_ch: 1
+  backend: arduino
+  arduino_port: ""
+  arduino_baud: 115200
+  pan_ch: 4
+  tilt_ch: 5
   pan_min: 40.0
   pan_max: 130.0
   tilt_min: 80.0
@@ -221,3 +224,20 @@ servo:
   talk_gesture_tilt_mult_no_face: 10.0
   face_talk_punch_scale: 0.45
   face_talk_af_thresh: 0.04
+
+base:
+  enabled: true
+  counts_per_degree: 37.855556
+  max_relative_deg: 180.0
+  move_timeout_sec: 15.0
+
+tof:
+  enabled: true
+  poll_hz: 5.0
+  min_valid_mm: 30.0
+  present_max_mm: 1500.0
+  absent_min_mm: 2000.0
+  debounce_present_sec: 0.25
+  debounce_absent_sec: 0.5
+  labels: [left, center, right]
+  mux_channels: [0, 1, 2]

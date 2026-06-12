@@ -3,7 +3,7 @@
 Face Tracking Eyes for Dual SPI Displays (Picamera2)
 Combines face tracking (YuNet) with dual SPI display output (ST7735).
 
-Optional: ServoKit pan/tilt face following (non-PID smoothing).
+Optional: ESP32 pan/tilt face following via USB serial (PCA9685).
 """
 
 import time
@@ -26,6 +26,18 @@ from robot_config import (
     load_config,
     patch_config,
     save_config,
+)
+from servo_driver import create_servo_driver
+from head_servo_axes import check_servo_channel_config
+from tof_presence import TofPresenceTracker, TofSnapshot, TofPresence, sanitize_tof_snapshot
+from animation_player import AnimationPlayer
+from botango_loader import (
+    DEFAULT_ARM_NEUTRALS,
+    _parse_setup,
+    format_servo_stop_pose,
+    load_botango_commands_file,
+    neutral_arm_degrees,
+    servo_stop_pose,
 )
 
 # Shared amplitude state written by the UDP thread, read by the render loop
@@ -59,12 +71,6 @@ except ImportError:
     print("Error: picamera2 not found. Please install with: sudo apt install python3-picamera2")
     sys.exit(1)
 
-try:
-    from adafruit_servokit import ServoKit
-except ImportError:
-    ServoKit = None
-
-
 # --- Configuration (loaded from config.yaml) ---
 _cfg_path = Path(__file__).parent / "config.yaml"
 cfg = load_config(_cfg_path)
@@ -79,6 +85,8 @@ _ft = cfg.face_tracking
 _em = cfg.emotion
 _gz = cfg.gaze
 _sv = cfg.servo
+_base = cfg.base
+_tof = cfg.tof
 
 SCREEN_WIDTH = _d.screen_width
 SCREEN_HEIGHT = _d.screen_height
@@ -305,6 +313,14 @@ STREAM_FPS = _s.fps
 STREAM_JPEG_QUALITY = _s.jpeg_quality
 RENDER_FPS = _s.render_fps
 VISION_FPS = _s.vision_fps
+
+TOF_ENABLED = _tof.enabled
+TOF_POLL_HZ = _tof.poll_hz
+TOF_PRESENT_MAX_MM = _tof.present_max_mm
+TOF_ABSENT_MIN_MM = _tof.absent_min_mm
+TOF_MIN_VALID_MM = int(_tof.min_valid_mm)
+TOF_DEBOUNCE_PRESENT_SEC = _tof.debounce_present_sec
+TOF_DEBOUNCE_ABSENT_SEC = _tof.debounce_absent_sec
 
 ENABLE_SERVO = _sv.enabled
 PAN_CH = _sv.pan_ch
@@ -599,6 +615,7 @@ def handle_api_trigger(data: dict) -> dict:
     global udp_emotion_override, udp_emotion_until
     global udp_conv_state, udp_conv_emotion
     global wake_request_ts, amplitude_fast, amplitude_slow, udp_speak_pulse
+    global animation_arm_targets
 
     action = data.get("action")
     if action == "emotion":
@@ -627,6 +644,25 @@ def handle_api_trigger(data: dict) -> dict:
         udp_conv_state = "speaking"
         udp_conv_emotion = "engaged"
         return {"ok": True, "action": "speaking"}
+    if action == "animation":
+        clip_id = str(data.get("clip_id", "")).strip()
+        if not clip_id:
+            return {"ok": False, "error": "missing clip_id"}
+        loop = bool(data.get("loop", False))
+        with animation_lock:
+            ok = animation_player.play(clip_id, loop=loop)
+        if not ok:
+            return {"ok": False, "error": f"unknown clip_id: {clip_id}"}
+        return {"ok": True, "action": "animation", "clip_id": clip_id, "loop": loop}
+    if action == "animation_stop":
+        with animation_lock:
+            animation_player.stop()
+            animation_arm_targets = dict(neutral_arm_targets)
+        return {
+            "ok": True,
+            "action": "animation_stop",
+            "stop_pose": servo_stop_pose(neutral_arm_targets),
+        }
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
@@ -1417,7 +1453,7 @@ squint_until = 0.0
 servo_state_lock = threading.Lock()
 servo_running = False
 servo_thread = None
-servo_kit = None
+servo_driver = None
 servo_target_pan = (PAN_MIN + PAN_MAX) * 0.5
 servo_target_tilt = (TILT_MIN + TILT_MAX) * 0.5
 servo_current_pan = servo_target_pan
@@ -1482,6 +1518,26 @@ face_present_since_ts = None
 # Servo aversion offsets (added on top of face tracking servo targets)
 servo_aversion_pan_offset = 0.0
 servo_aversion_tilt_offset = 0.0
+
+animation_lock = threading.Lock()
+animation_player = AnimationPlayer()
+neutral_arm_targets: dict[str, float] = dict(DEFAULT_ARM_NEUTRALS)
+animation_arm_targets: dict[str, float] = dict(neutral_arm_targets)
+arm_current_smoothed: dict[str, float] = dict(neutral_arm_targets)
+_last_servo_frame_ts = 0.0
+SERVO_FRAME_INTERVAL = 1.0 / 30.0
+ARM_ANIM_BLEND = 0.45
+BOTANGO_COMMANDS_FILE = "AnimationCommands.json"
+
+tof_lock = threading.Lock()
+tof_snapshot = TofSnapshot(-1, -1, -1)
+tof_presence = TofPresence(False, False, False, False, 0)
+tof_tracker = TofPresenceTracker(
+    present_max_mm=TOF_PRESENT_MAX_MM,
+    absent_min_mm=TOF_ABSENT_MIN_MM,
+    debounce_present_sec=TOF_DEBOUNCE_PRESENT_SEC,
+    debounce_absent_sec=TOF_DEBOUNCE_ABSENT_SEC,
+)
 
 
 def clamp(value, lo, hi):
@@ -1699,11 +1755,98 @@ def update_gaze_manager(now: float):
             servo_aversion_tilt_offset = gaze_override_y * GAZE_SERVO_TILT_PER_PX
 
 
+def head_center_angles() -> tuple[float, float]:
+    return (PAN_MIN + PAN_MAX) * 0.5, (TILT_MIN + TILT_MAX) * 0.5
+
+
+def _blend_track(base: float, sample_value: float, mode: str, weight: float) -> float:
+    w = max(0.0, min(1.0, float(weight)))
+    if str(mode).lower() == "override":
+        return base + (sample_value - base) * w
+    return base + (sample_value * w)
+
+
+def _load_default_animation_clips() -> int:
+    clips_dir = Path(__file__).parent / "animations"
+    if not clips_dir.exists():
+        return 0
+    loaded = 0
+    global animation_arm_targets, arm_current_smoothed, neutral_arm_targets
+
+    botango_path = clips_dir / BOTANGO_COMMANDS_FILE
+    if botango_path.exists():
+        try:
+            clips = load_botango_commands_file(botango_path)
+            for clip in clips:
+                animation_player.register_clip(clip)
+                loaded += 1
+            with botango_path.open(encoding="utf-8") as f:
+                raw = json.load(f)
+            controllers = raw if isinstance(raw, list) else [raw]
+            for controller in controllers:
+                setup_text = controller.get("Setup", {}).get("Controller Setup Commands", "")
+                effectors = _parse_setup(setup_text)
+                neutrals = neutral_arm_degrees(effectors)
+                if neutrals:
+                    neutral_arm_targets.update(neutrals)
+                    animation_arm_targets.update(neutrals)
+                    arm_current_smoothed.update(neutrals)
+            print(
+                f"Loaded {len(clips)} Botango animation(s) from {BOTANGO_COMMANDS_FILE}: "
+                + ", ".join(c.clip_id for c in clips)
+            )
+            print(format_servo_stop_pose(servo_stop_pose(neutral_arm_targets)))
+        except Exception as e:
+            print(f"Botango animation load failed ({BOTANGO_COMMANDS_FILE}): {e}")
+
+    for fp in sorted(clips_dir.glob("*.json")):
+        if fp.name == BOTANGO_COMMANDS_FILE:
+            continue
+        try:
+            animation_player.load_clip_file(fp)
+            loaded += 1
+        except Exception as e:
+            print(f"Animation clip load failed ({fp.name}): {e}")
+    return loaded
+
+
+def get_tof_state() -> dict:
+    with tof_lock:
+        return {
+            "enabled": TOF_ENABLED,
+            "snapshot": tof_snapshot.as_dict(),
+            "presence": tof_presence.as_dict(),
+        }
+
+
+def tof_worker():
+    global tof_snapshot, tof_presence
+    if not TOF_ENABLED or servo_driver is None:
+        return
+    interval = 1.0 / max(0.5, float(TOF_POLL_HZ))
+    while running:
+        try:
+            snap = servo_driver.poll_tof()
+            if snap is not None:
+                snap = sanitize_tof_snapshot(
+                    snap,
+                    min_valid_mm=TOF_MIN_VALID_MM,
+                )
+                presence = tof_tracker.update(snap)
+                with tof_lock:
+                    tof_snapshot = snap
+                    tof_presence = presence
+        except Exception as e:
+            print(f"ToF poll error: {e}")
+        time.sleep(interval)
+
+
 def servo_worker():
     global servo_current_pan, servo_current_tilt, servo_running, jerk_until, jerk_direction
     global amplitude_fast, amplitude_slow, udp_speak_pulse, udp_conv_state
     global current_emotion, gaze_event_active, no_face_mode, sad_return_start, wake_tilt_jerk_until
-    if servo_kit is None:
+    global animation_arm_targets, arm_current_smoothed, _last_servo_frame_ts
+    if servo_driver is None:
         return
 
     while servo_running:
@@ -1766,9 +1909,43 @@ def servo_worker():
         if current_emotion == "sleepy" and not gaze_event_active:
             sleep_tilt = SLEEP_TILT_DEG
 
-        pan_error = (pan_target + jerk_offset + pan_avert + subtle_pan) - pan_current
+        anim_samples = {}
+        with animation_lock:
+            anim_samples = animation_player.sample(now)
+
+        pan_target_blended = pan_target
+        tilt_target_blended = tilt_target
+        if "head_pan" in anim_samples:
+            s = anim_samples["head_pan"]
+            pan_target_blended = _blend_track(pan_target_blended, s.value, s.mode, s.weight)
+        if "head_tilt" in anim_samples:
+            s = anim_samples["head_tilt"]
+            tilt_target_blended = _blend_track(tilt_target_blended, s.value, s.mode, s.weight)
+
+        if not anim_samples:
+            arm_targets = dict(neutral_arm_targets)
+        else:
+            arm_targets = dict(animation_arm_targets)
+            for arm_track in ("arm_0", "arm_1", "arm_2", "arm_3"):
+                if arm_track in anim_samples:
+                    s = anim_samples[arm_track]
+                    base = neutral_arm_targets.get(arm_track, 90.0)
+                    arm_targets[arm_track] = _blend_track(base, s.value, s.mode, s.weight)
+        animation_arm_targets = arm_targets
+
+        animating = bool(anim_samples)
+        arm_alpha = ARM_ANIM_BLEND if animating else 0.18
+        for arm_track in ("arm_0", "arm_1", "arm_2", "arm_3"):
+            tgt = arm_targets.get(arm_track, neutral_arm_targets.get(arm_track, 90.0))
+            cur = arm_current_smoothed.get(arm_track, tgt)
+            if animating or abs(tgt - cur) > 0.4:
+                arm_current_smoothed[arm_track] = cur + (tgt - cur) * arm_alpha
+            else:
+                arm_current_smoothed[arm_track] = tgt
+
+        pan_error = (pan_target_blended + jerk_offset + pan_avert + subtle_pan) - pan_current
         tilt_error = (
-            tilt_target + tilt_avert + conv_tilt + subtle_tilt + sad_nod_tilt + wake_tilt + sleep_tilt
+            tilt_target_blended + tilt_avert + conv_tilt + subtle_tilt + sad_nod_tilt + wake_tilt + sleep_tilt
         ) - tilt_current
 
         if abs(pan_error) < SERVO_DEADZONE_DEG:
@@ -1787,11 +1964,29 @@ def servo_worker():
         pan_current = clamp(pan_current + pan_step, PAN_MIN, PAN_MAX)
         tilt_current = clamp(tilt_current + tilt_step, TILT_MIN, TILT_MAX)
 
-        try:
-            servo_kit.servo[PAN_CH].angle = pan_current
-            servo_kit.servo[TILT_CH].angle = tilt_current
-        except Exception as e:
-            print(f"Servo write error: {e}")
+        send_frame = animating or (now - _last_servo_frame_ts) >= SERVO_FRAME_INTERVAL
+        if send_frame:
+            try:
+                frame_tokens: dict[str, float] = {"P": pan_current, "T": tilt_current}
+                frame_tokens["A0="] = clamp(
+                    arm_current_smoothed.get("arm_0", neutral_arm_targets.get("arm_0", 0.0)), 0.0, 180.0
+                )
+                frame_tokens["A1="] = clamp(
+                    arm_current_smoothed.get("arm_1", neutral_arm_targets.get("arm_1", 180.0)), 0.0, 180.0
+                )
+                frame_tokens["A2="] = clamp(
+                    arm_current_smoothed.get("arm_2", neutral_arm_targets.get("arm_2", 90.0)), 0.0, 180.0
+                )
+                frame_tokens["A3="] = clamp(
+                    arm_current_smoothed.get("arm_3", neutral_arm_targets.get("arm_3", 90.0)), 0.0, 180.0
+                )
+                if hasattr(servo_driver, "write_servo_frame"):
+                    servo_driver.write_servo_frame(frame_tokens)
+                else:
+                    servo_driver.write_angles(pan_current, tilt_current)
+                _last_servo_frame_ts = now
+            except Exception as e:
+                print(f"Servo write error: {e}")
 
         with servo_state_lock:
             servo_current_pan = pan_current
@@ -1886,6 +2081,11 @@ def get_runtime_state() -> dict:
             "target_pan": round(servo_target_pan, 2),
             "target_tilt": round(servo_target_tilt, 2),
         }
+    with animation_lock:
+        active_clip = animation_player.active_clip_id()
+    servo["animation_clip"] = active_clip
+    if servo_driver is not None:
+        servo["serial_connected"] = getattr(servo_driver, "serial_connected", False)
 
     return {
         "timestamp": time.time(),
@@ -1910,6 +2110,7 @@ def get_runtime_state() -> dict:
         },
         "face": face,
         "servo": servo,
+        "tof": get_tof_state(),
     }
 
 
@@ -2051,7 +2252,7 @@ def vision_worker():
                     local_x = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, norm_x * MAX_X_OFFSET))
                     local_y = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, norm_y * MAX_Y_OFFSET))
 
-                    if ENABLE_SERVO and servo_kit is not None:
+                    if ENABLE_SERVO and servo_driver is not None:
                         pan_center = (PAN_MIN + PAN_MAX) * 0.5
                         tilt_center = (TILT_MIN + TILT_MAX) * 0.5
                         mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
@@ -2110,7 +2311,7 @@ def vision_worker():
                         local_x = NO_FACE_IDLE_EYE_X
                         local_y = NO_FACE_IDLE_EYE_Y
 
-                if ENABLE_SERVO and servo_kit is not None and not face_locked:
+                if ENABLE_SERVO and servo_driver is not None and not face_locked:
                     pan_center = (PAN_MIN + PAN_MAX) * 0.5
                     tilt_center = (TILT_MIN + TILT_MAX) * 0.5
                     pan_idle = clamp(
@@ -2197,25 +2398,24 @@ def vision_worker():
 print("Starting Tracking Loop...")
 time.sleep(1.0) # Warmup
 
+_load_default_animation_clips()
+
 if ENABLE_SERVO:
-    if ServoKit is None:
-        print("ServoKit not installed; running eyes-only mode.")
+    check_servo_channel_config(cfg.servo.pan_ch, cfg.servo.tilt_ch, backend=cfg.servo.backend)
+    servo_driver = create_servo_driver(cfg)
+    if servo_driver is not None:
+        pan_c, tilt_c = head_center_angles()
+        servo_driver.write_angles(pan_c, tilt_c, force=True)
+        print(f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} — face tracking enabled")
+        servo_running = True
+        servo_thread = threading.Thread(target=servo_worker, daemon=True)
+        servo_thread.start()
     else:
-        try:
-            print("Initializing ServoKit...")
-            servo_kit = ServoKit(channels=16)
-            servo_kit.servo[PAN_CH].set_pulse_width_range(PULSE_MIN, PULSE_MAX)
-            servo_kit.servo[TILT_CH].set_pulse_width_range(PULSE_MIN, PULSE_MAX)
-            servo_kit.servo[PAN_CH].angle = servo_current_pan
-            servo_kit.servo[TILT_CH].angle = servo_current_tilt
-            servo_running = True
-            servo_thread = threading.Thread(target=servo_worker, daemon=True)
-            servo_thread.start()
-            print("Servo tracking enabled.")
-        except Exception as e:
-            print(f"Servo init failed, continuing eyes-only: {e}")
-            servo_kit = None
-            servo_running = False
+        print("Head servo driver unavailable; running eyes-only mode.")
+
+if TOF_ENABLED and servo_driver is not None:
+    threading.Thread(target=tof_worker, daemon=True).start()
+    print(f"ToF presence polling at {TOF_POLL_HZ:.1f} Hz (ESP32 F command)")
 
 if STREAM_ENABLED:
     try:
@@ -3030,11 +3230,11 @@ finally:
         servo_running = False
         servo_thread.join(timeout=1.0)
 
-    if servo_kit is not None:
+    if servo_driver is not None:
         try:
-            servo_kit.servo[PAN_CH].angle = None
-            servo_kit.servo[TILT_CH].angle = None
-            print("Servos relaxed.")
+            pan_home, tilt_home = head_center_angles()
+            servo_driver.close(home_pan=pan_home, home_tilt=tilt_home)
+            print("Servos homed and serial closed.")
         except Exception as e:
             print(e)
 
