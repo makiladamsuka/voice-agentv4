@@ -1,138 +1,526 @@
 #!/usr/bin/env python3
 """
-Standalone pan/tilt servo test for ESP32 + PCA9685 (head_servo firmware).
+Interactive elastic pan/tilt + base test for ESP32 (head_servo firmware).
 
-Does not start robot_eyes, camera, or voice agent.
+Velocity ramps up while a key is held and eases down on release — head and base,
+no sudden jumps.
 
-  cd backend && python tests/test_head_servos.py
-  python tests/test_head_servos.py --verify --hold 5
-  python tests/test_head_servos.py --port /dev/ttyUSB0
-  python tests/test_head_servos.py --pan 40 --tilt 80
-  python tests/test_head_servos.py --sweep
+  cd backend && python tests/test_head_servos.py --port /dev/ttyUSB0
+
+Keys (inverted tilt, same as testservos2):
+  W/S = tilt up/down     A/D = pan left/right
+  M/N = base nudge per tap  C = spring to center
+  Q or Ctrl+C = home and quit
 """
 
 from __future__ import annotations
 
 import argparse
+import select
 import sys
+import termios
+import tty
 import time
 
 import _bootstrap  # noqa: F401
 
 from arduino_servo import ArduinoServoLink
+from elastic_head_motion import (
+    HeadMotionParams,
+    clamp,
+    tick_axis,
+    tick_spring,
+)
+from robot_config import load_config
 
-PAN_MIN = 40.0
-PAN_MAX = 130.0
-TILT_MIN = 80.0
-TILT_MAX = 130.0
-PAN_CENTER = 85.0
-TILT_CENTER = 105.0
-DEFAULT_HOLD_SEC = 5.0
+LOOP_HZ = 100.0
+KEY_TIMEOUT = 0.8
+DEBUG_HZ = 8.0
+BASE_POLL_HZ = 1.5
+DEFAULT_HOLD_SEC = 3.0
+CONTROL_KEYS = frozenset("wasd")
 
-DEMO_STEPS = [
-    ("pan left (min)", PAN_MIN, TILT_CENTER),
-    ("pan right (max)", PAN_MAX, TILT_CENTER),
-    ("center", PAN_CENTER, TILT_CENTER),
-    ("center pan", PAN_CENTER, TILT_CENTER),
-    ("tilt down (min)", PAN_CENTER, TILT_MIN),
-    ("tilt up (max)", PAN_CENTER, TILT_MAX),
-    ("return center", PAN_CENTER, TILT_CENTER),
-]
+# Head elastic — defaults from elastic_head_motion; override vel_blend here if needed
+HEAD_VEL_BLEND = 0.28
+PAN_MOTION = HeadMotionParams(
+    max_vel_pos=22.0,
+    max_vel_neg=22.0,
+    accel=55.0,
+    decel=85.0,
+    vel_blend=HEAD_VEL_BLEND,
+)
+TILT_MOTION = HeadMotionParams(
+    max_vel_pos=18.0,
+    max_vel_neg=10.0,
+    accel=45.0,
+    decel=70.0,
+    vel_blend=HEAD_VEL_BLEND,
+    decel_boost_dir=-1.0,
+    decel_boost_mult=1.85,
+)
+
+# Base tap (M/N = one small encoder move per press)
+BASE_TAP_DEG = 3.0
+BASE_TAP_DEBOUNCE_SEC = 0.22
+
+# Spring return to center (home / C key)
+SPRING_K = 9.0
+SPRING_DAMP = 6.5
+HOME_SETTLE_VEL = 0.35
+HOME_SETTLE_POS = 0.4
+BASE_HOME_DEG = 0.0
+BASE_HOME_SETTLE_DEG = 0.5
 
 
-def write_and_report(
+def _limits() -> tuple[float, float, float, float, float, float]:
+    cfg = load_config()
+    sv = cfg.servo
+    pan_min = float(sv.pan_min)
+    pan_max = float(sv.pan_max)
+    tilt_min = float(sv.tilt_min)
+    tilt_max = float(sv.tilt_max)
+    pan_center = (pan_min + pan_max) * 0.5
+    tilt_center = (tilt_min + tilt_max) * 0.5
+    return pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center
+
+
+def _get_key() -> str | None:
+    if select.select([sys.stdin], [], [], 0)[0]:
+        return sys.stdin.read(1)
+    return None
+
+
+def _drain_keys() -> list[str]:
+    keys: list[str] = []
+    while True:
+        key = _get_key()
+        if key is None:
+            break
+        keys.append(key)
+    return keys
+
+
+def _read_base_deg(link: ArduinoServoLink) -> float | None:
+    st = link.query_status()
+    return st.degrees if st is not None else None
+
+
+def _home_base(link: ArduinoServoLink, target_deg: float = BASE_HOME_DEG) -> None:
+    _stop_base(link)
+    st = link.query_status()
+    if (
+        st is not None
+        and not st.busy
+        and abs(st.degrees - target_deg) < BASE_HOME_SETTLE_DEG
+    ):
+        return
+    print(f"Homing base to {target_deg:.1f}°...")
+    link.write_base_absolute(target_deg, wait=True)
+
+
+def _home_robot(
     link: ArduinoServoLink,
-    label: str,
     pan: float,
+    pan_vel: float,
     tilt: float,
+    tilt_vel: float,
     *,
-    verify: bool,
-    hold_sec: float,
-) -> None:
-    print(f"  -> {label}: Pi sent P{pan:.1f} T{tilt:.1f}", end="")
-    if not link.write_angles(pan, tilt, force=True, wait_ack=verify):
-        print(" — write failed")
-        sys.exit(1)
-    if verify:
-        ack = link._last_ack
-        if ack is None:
-            print(" — no ACK (re-flash firmware with DEBUG_ACK?)")
-        else:
-            print(f" → Nano ACK P{ack[0]} T{ack[1]}")
-    else:
+    loop_delay: float,
+    pan_center: float,
+    tilt_center: float,
+    base_home_deg: float = BASE_HOME_DEG,
+) -> tuple[float, float]:
+    _home_base(link, base_home_deg)
+    pan, pan_vel, tilt, tilt_vel = _elastic_home_head(
+        link,
+        pan,
+        pan_vel,
+        tilt,
+        tilt_vel,
+        loop_delay=loop_delay,
+        pan_center=pan_center,
+        tilt_center=tilt_center,
+    )
+    return pan, tilt
+
+
+def _elastic_home_head(
+    link: ArduinoServoLink,
+    pan: float,
+    pan_vel: float,
+    tilt: float,
+    tilt_vel: float,
+    *,
+    loop_delay: float,
+    pan_center: float,
+    tilt_center: float,
+) -> tuple[float, float, float, float]:
+    print(f"\nHoming head (P{pan_center:.1f} T{tilt_center:.1f})...")
+    while True:
+        pan, pan_vel = tick_spring(pan, pan_vel, pan_center, loop_delay)
+        tilt, tilt_vel = tick_spring(tilt, tilt_vel, tilt_center, loop_delay)
+        link.write_angles(pan, tilt)
+        if (
+            abs(pan - pan_center) < HOME_SETTLE_POS
+            and abs(tilt - tilt_center) < HOME_SETTLE_POS
+            and abs(pan_vel) < HOME_SETTLE_VEL
+            and abs(tilt_vel) < HOME_SETTLE_VEL
+        ):
+            link.write_angles(pan_center, tilt_center, force=True)
+            return pan_center, 0.0, tilt_center, 0.0
+        time.sleep(loop_delay)
+
+
+def _stop_base(link: ArduinoServoLink) -> None:
+    link.write_base_stop()
+
+
+def _queue_base_tap(
+    queue: list[float],
+    deg: float,
+    *,
+    last_tap_ts: float,
+    now: float,
+) -> float:
+    if now - last_tap_ts < BASE_TAP_DEBOUNCE_SEC:
+        return last_tap_ts
+    queue.append(deg)
+    return now
+
+
+def _run_base_tap(link: ArduinoServoLink, queue: list[float]) -> bool:
+    if not queue:
+        return False
+    deg = queue.pop(0)
+    link.write_base_relative(deg, wait=True)
+    return True
+
+
+def run_interactive(
+    link: ArduinoServoLink,
+    *,
+    loop_delay: float,
+    key_timeout: float,
+) -> tuple[float, float]:
+    pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center = _limits()
+
+    pan = pan_center
+    tilt = tilt_center
+    pan_vel = 0.0
+    tilt_vel = 0.0
+    base_deg: float | None = _read_base_deg(link)
+    base_tap_queue: list[float] = []
+    base_tap_busy = False
+    last_base_tap_ts = 0.0
+
+    pan_input = 0.0
+    tilt_input = 0.0
+    spring_center = False
+
+    key_last_seen: dict[str, float] = {}
+    last_debug_ts = 0.0
+    last_base_poll_ts = 0.0
+    running = True
+
+    link.write_angles(pan, tilt, force=True)
+    link.set_tof_stream(False)
+
+    print("--- Elastic head + base control (ESP32) ---")
+    print("  W/S = tilt up/down (inverted)   A/D = pan left/right")
+    print(f"  M/N = base nudge ±{BASE_TAP_DEG:.0f}° per tap (M=right, N=left)")
+    print("  WASD + M/N together = move head and nudge base")
+    print("  C = spring head to center       Q or Ctrl+C = home head + base and quit")
+    print(
+        f"  Tilt down uses extra braking (gravity). "
+        f"Loop {1.0 / loop_delay:.0f} Hz"
+    )
+    if base_deg is not None:
+        print(
+            f"  Base zero = {BASE_HOME_DEG:.1f}°  "
+            f"current {base_deg:+.1f}° from zero"
+        )
+
+    old_settings = termios.tcgetattr(sys.stdin)
+    try:
+        tty.setcbreak(sys.stdin.fileno())
+        try:
+            while running:
+                key_now = time.time()
+                for key in _drain_keys():
+                    k = key.lower()
+                    if k == "q":
+                        running = False
+                    elif k == "c":
+                        spring_center = True
+                        pan_input = tilt_input = 0.0
+                        for head_key in "wasd":
+                            key_last_seen.pop(head_key, None)
+                    elif k == "m":
+                        last_base_tap_ts = _queue_base_tap(
+                            base_tap_queue,
+                            -BASE_TAP_DEG,
+                            last_tap_ts=last_base_tap_ts,
+                            now=key_now,
+                        )
+                        spring_center = False
+                    elif k == "n":
+                        last_base_tap_ts = _queue_base_tap(
+                            base_tap_queue,
+                            BASE_TAP_DEG,
+                            last_tap_ts=last_base_tap_ts,
+                            now=key_now,
+                        )
+                        spring_center = False
+                    elif k in CONTROL_KEYS:
+                        key_last_seen[k] = key_now
+                        spring_center = False
+
+                now = key_now
+                active_keys = {
+                    k
+                    for k, ts in key_last_seen.items()
+                    if now - ts < key_timeout
+                }
+
+                pan_input = 0.0
+                tilt_input = 0.0
+                if not spring_center:
+                    if "a" in active_keys:
+                        pan_input -= 1.0
+                    if "d" in active_keys:
+                        pan_input += 1.0
+                    if "w" in active_keys:
+                        tilt_input += 1.0
+                    if "s" in active_keys:
+                        tilt_input -= 1.0
+
+                if spring_center:
+                    pan, pan_vel = tick_spring(pan, pan_vel, pan_center, loop_delay)
+                    tilt, tilt_vel = tick_spring(tilt, tilt_vel, tilt_center, loop_delay)
+                    if (
+                        abs(pan - pan_center) < HOME_SETTLE_POS
+                        and abs(tilt - tilt_center) < HOME_SETTLE_POS
+                        and abs(pan_vel) < HOME_SETTLE_VEL
+                        and abs(tilt_vel) < HOME_SETTLE_VEL
+                    ):
+                        pan, tilt = pan_center, tilt_center
+                        pan_vel = tilt_vel = 0.0
+                        spring_center = False
+                else:
+                    pan, pan_vel = tick_axis(
+                        pan,
+                        pan_vel,
+                        pan_input,
+                        loop_delay,
+                        lo=pan_min,
+                        hi=pan_max,
+                        params=PAN_MOTION,
+                    )
+                    tilt, tilt_vel = tick_axis(
+                        tilt,
+                        tilt_vel,
+                        tilt_input,
+                        loop_delay,
+                        lo=tilt_min,
+                        hi=tilt_max,
+                        params=TILT_MOTION,
+                    )
+
+                link.write_angles(pan, tilt)
+
+                if base_tap_queue and not base_tap_busy:
+                    base_tap_busy = True
+                    _run_base_tap(link, base_tap_queue)
+                    polled = _read_base_deg(link)
+                    if polled is not None:
+                        base_deg = polled
+                    base_tap_busy = False
+
+                if now - last_debug_ts >= 1.0 / DEBUG_HZ:
+                    if base_tap_busy:
+                        spin_lbl = "move"
+                    elif base_tap_queue:
+                        spin_lbl = f"q{len(base_tap_queue)}"
+                    else:
+                        spin_lbl = "stop"
+                    driving = bool(active_keys & CONTROL_KEYS) or base_tap_busy
+                    if (
+                        not driving
+                        and now - last_base_poll_ts >= 1.0 / BASE_POLL_HZ
+                    ):
+                        polled = _read_base_deg(link)
+                        if polled is not None:
+                            base_deg = polled
+                        last_base_poll_ts = now
+                    base_pos = f"{base_deg:+.1f}°" if base_deg is not None else "?"
+                    sys.stdout.write(
+                        f"\r  pan {pan:5.1f}  tilt {tilt:5.1f}  "
+                        f"base {base_pos} ({spin_lbl})   "
+                    )
+                    sys.stdout.flush()
+                    last_debug_ts = now
+
+                time.sleep(loop_delay)
+        except KeyboardInterrupt:
+            print("\nCtrl+C — homing...")
+    finally:
         print()
-    time.sleep(hold_sec)
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        _stop_base(link)
+        base_tap_queue.clear()
+
+    pan, tilt = _home_robot(
+        link,
+        pan,
+        pan_vel,
+        tilt,
+        tilt_vel,
+        loop_delay=loop_delay,
+        pan_center=pan_center,
+        tilt_center=tilt_center,
+        base_home_deg=BASE_HOME_DEG,
+    )
+    return pan, tilt
 
 
-def run_demo(link: ArduinoServoLink, *, verify: bool, hold_sec: float) -> None:
-    print("Running demo sweep (Ctrl+C to stop early)...")
-    for label, pan, tilt in DEMO_STEPS:
-        write_and_report(link, label, pan, tilt, verify=verify, hold_sec=hold_sec)
+def _demo_steps() -> list[tuple[str, float, float]]:
+    pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center = _limits()
+    return [
+        ("pan left (min)", pan_min, tilt_center),
+        ("pan right (max)", pan_max, tilt_center),
+        ("center", pan_center, tilt_center),
+        ("tilt down (min)", pan_center, tilt_min),
+        ("tilt up (max)", pan_center, tilt_max),
+        ("return center", pan_center, tilt_center),
+    ]
+
+
+def run_demo(link: ArduinoServoLink, *, hold_sec: float, loop_delay: float) -> None:
+    pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center = _limits()
+    pan, pan_vel = pan_center, 0.0
+    tilt, tilt_vel = tilt_center, 0.0
+    print("Elastic demo sweep...")
+    for label, goal_pan, goal_tilt in _demo_steps():
+        print(f"  -> {label}")
+        while True:
+            pan, pan_vel = tick_spring(pan, pan_vel, goal_pan, loop_delay, k=6.0)
+            tilt, tilt_vel = tick_spring(tilt, tilt_vel, goal_tilt, loop_delay, k=6.0)
+            link.write_angles(pan, tilt)
+            if (
+                abs(pan - goal_pan) < HOME_SETTLE_POS
+                and abs(tilt - goal_tilt) < HOME_SETTLE_POS
+                and abs(pan_vel) < HOME_SETTLE_VEL
+                and abs(tilt_vel) < HOME_SETTLE_VEL
+            ):
+                break
+            time.sleep(loop_delay)
+        time.sleep(hold_sec)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Test head servos via ESP32 USB serial")
-    parser.add_argument("--port", default="", help="Serial port (default: auto USB0/ACM0)")
-    parser.add_argument("--baud", type=int, default=115200, help="Serial baud rate")
-    parser.add_argument("--no-demo", action="store_true", help="Skip demo sweep")
-    parser.add_argument("--pan", type=float, default=None, help="Single pan angle (degrees)")
-    parser.add_argument("--tilt", type=float, default=None, help="Single tilt angle (degrees)")
+    parser = argparse.ArgumentParser(
+        description="Elastic interactive head + base test (ESP32 USB serial)"
+    )
+    parser.add_argument("--port", default="", help="Serial port (default: auto)")
+    parser.add_argument("--baud", type=int, default=115200)
+    parser.add_argument("--demo", action="store_true", help="Elastic pose demo sweep")
+    parser.add_argument("--pan", type=float, default=None, help="Single pan angle")
+    parser.add_argument("--tilt", type=float, default=None, help="Single tilt angle")
+    parser.add_argument("--hold", type=float, default=DEFAULT_HOLD_SEC)
+    parser.add_argument("--sweep", action="store_true", help="Onboard bench sweep (S)")
     parser.add_argument(
-        "--hold",
+        "--loop-delay",
         type=float,
-        default=DEFAULT_HOLD_SEC,
-        help=f"Seconds to hold each pose (default {DEFAULT_HOLD_SEC})",
+        default=1.0 / LOOP_HZ,
+        help=f"Control loop period (default {1.0 / LOOP_HZ:.3f}s)",
     )
-    parser.add_argument(
-        "--verify",
-        action="store_true",
-        help="Read ESP32 OK P.. T.. ACK after each command",
-    )
-    parser.add_argument(
-        "--sweep",
-        action="store_true",
-        help="Run onboard pan bench sweep (S command, ~6s)",
-    )
+    parser.add_argument("--key-timeout", type=float, default=KEY_TIMEOUT)
     args = parser.parse_args()
+    loop_delay = max(0.005, args.loop_delay)
 
     link = ArduinoServoLink(port=args.port, baud=args.baud)
     if not link.connect():
-        print("Failed to connect. Check USB, dialout group, and head_servo firmware (READY).")
+        print("Failed to connect. Check USB and head_servo firmware (READY).")
         return 1
 
+    try:
+        from base_motor_utils import apply_config_cpd_to_nano
+
+        apply_config_cpd_to_nano(link)
+    except Exception as e:
+        print(f"Note: base CPD not applied ({e})")
+
+    pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center = _limits()
+    base_start = _read_base_deg(link)
     print(
-        "Watch servos during each hold (not only after Done). "
-        "If ACK angles change but servos do not move: check 5V supply, horn screw, pulse on D9."
+        f"Head center P{pan_center:.1f} T{tilt_center:.1f}  "
+        f"pan [{pan_min:.0f},{pan_max:.0f}]  tilt [{tilt_min:.0f},{tilt_max:.0f}]"
     )
+    if base_start is not None:
+        print(
+            f"Base zero reference {BASE_HOME_DEG:.1f}°  "
+            f"(at connect: {base_start:+.1f}°)"
+        )
+
+    pan_current, tilt_current = pan_center, tilt_center
+    homed = False
 
     try:
         if args.sweep:
             print("Sending bench sweep (S)...")
             if not link.run_bench_sweep():
-                print("Sweep command failed.")
                 return 1
-            print("Sweep finished.")
         elif args.pan is not None and args.tilt is not None:
-            pan = max(PAN_MIN, min(PAN_MAX, args.pan))
-            tilt = max(TILT_MIN, min(TILT_MAX, args.tilt))
-            write_and_report(
+            pan_g = clamp(args.pan, pan_min, pan_max)
+            tilt_g = clamp(args.tilt, tilt_min, tilt_max)
+            _elastic_home_head(
                 link,
-                "manual",
-                pan,
-                tilt,
-                verify=args.verify,
-                hold_sec=args.hold,
+                pan_center,
+                0.0,
+                tilt_center,
+                0.0,
+                loop_delay=loop_delay,
+                pan_center=pan_g,
+                tilt_center=tilt_g,
             )
-        elif not args.no_demo:
-            run_demo(link, verify=args.verify, hold_sec=args.hold)
+            time.sleep(args.hold)
+            pan_current, tilt_current = pan_g, tilt_g
+        elif args.demo:
+            run_demo(link, hold_sec=args.hold, loop_delay=loop_delay)
+            homed = True
         else:
-            print("Nothing to do. Use demo, --pan/--tilt, or --sweep.")
-            return 1
+            pan_current, tilt_current = run_interactive(
+                link,
+                loop_delay=loop_delay,
+                key_timeout=args.key_timeout,
+            )
+            homed = True
         print("Done.")
     except KeyboardInterrupt:
-        print("\nInterrupted — returning to center.")
+        print("\nInterrupted — homing...")
+        if not homed:
+            pan_current, tilt_current = _home_robot(
+                link,
+                pan_current,
+                0.0,
+                tilt_current,
+                0.0,
+                loop_delay=loop_delay,
+                pan_center=pan_center,
+                tilt_center=tilt_center,
+                base_home_deg=BASE_HOME_DEG,
+            )
+            homed = True
     finally:
-        link.close()
+        link.write_base_stop()
+        try:
+            link.close(
+                home_pan=pan_center,
+                home_tilt=tilt_center,
+                skip_home=homed,
+            )
+        except TypeError:
+            link.close(home_pan=pan_center, home_tilt=tilt_center)
 
     return 0
 

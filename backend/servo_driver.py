@@ -27,14 +27,70 @@ class ArduinoServoDriver:
     def write_servo_frame(self, values_by_token: dict[str, float], *, wait_ack: bool = False) -> bool:
         return self._link.write_servo_frame(values_by_token, wait_ack=wait_ack)
 
-    def poll_tof(self, timeout: float = 0.5) -> TofSnapshot | None:
+    def poll_tof(self, timeout: float = 1.0) -> TofSnapshot | None:
         return self._link.poll_tof(timeout)
 
     def set_tof_stream(self, enabled: bool, hz: float = 5.0) -> bool:
         return self._link.set_tof_stream(enabled, hz)
 
-    def close(self, *, home_pan: float | None = None, home_tilt: float | None = None) -> None:
-        self._link.close(home_pan=home_pan, home_tilt=home_tilt)
+    def write_home_pose(
+        self,
+        pan: float,
+        tilt: float,
+        arm_neutrals: dict[str, float] | None = None,
+        *,
+        wait_ack: bool = True,
+    ) -> bool:
+        return self._link.write_home_pose(
+            pan, tilt, arm_neutrals, wait_ack=wait_ack
+        )
+
+    def write_base_relative(self, deg: float, *, wait: bool = True) -> bool:
+        return self._link.write_base_relative(deg, wait=wait)
+
+    def write_base_relative_clamped(
+        self,
+        deg: float,
+        *,
+        max_from_zero: float,
+        wait: bool = True,
+    ) -> bool:
+        st = self.query_base_status()
+        base_now = st.degrees if st is not None else 0.0
+        if st is not None and st.busy:
+            return False
+        proposed = base_now + deg
+        if proposed > max_from_zero:
+            deg = max_from_zero - base_now
+        elif proposed < -max_from_zero:
+            deg = -max_from_zero - base_now
+        if abs(deg) < 0.25:
+            return False
+        return self.write_base_relative(deg, wait=wait)
+
+    def write_base_absolute(self, deg: float, *, wait: bool = True) -> bool:
+        return self._link.write_base_absolute(deg, wait=wait)
+
+    def write_base_stop(self) -> bool:
+        return self._link.write_base_stop()
+
+    def query_base_status(self):
+        return self._link.query_status()
+
+    def close(
+        self,
+        *,
+        home_pan: float | None = None,
+        home_tilt: float | None = None,
+        arm_neutrals: dict[str, float] | None = None,
+        skip_home: bool = False,
+    ) -> None:
+        self._link.close(
+            home_pan=home_pan,
+            home_tilt=home_tilt,
+            arm_neutrals=arm_neutrals,
+            skip_home=skip_home,
+        )
 
 
 class ServoKitDriver:
@@ -61,7 +117,15 @@ class ServoKitDriver:
             return False
         return self.write_angles(float(pan), float(tilt))
 
-    def close(self, *, home_pan: float | None = None, home_tilt: float | None = None) -> None:
+    def close(
+        self,
+        *,
+        home_pan: float | None = None,
+        home_tilt: float | None = None,
+        arm_neutrals: dict[str, float] | None = None,
+        skip_home: bool = False,
+    ) -> None:
+        del arm_neutrals, skip_home
         try:
             if home_pan is not None and home_tilt is not None:
                 self._kit.servo[self._pan_ch].angle = home_pan
@@ -74,7 +138,30 @@ class ServoKitDriver:
             print(e)
 
 
-def create_servo_driver(cfg: RobotConfig) -> Optional[ServoDriver]:
+def create_servo_driver(
+    cfg: RobotConfig,
+    *,
+    max_attempts: int = 1,
+    retry_delay_sec: float = 2.0,
+) -> Optional[ServoDriver]:
+    if not cfg.servo.enabled:
+        return None
+
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        driver = _create_servo_driver_once(cfg)
+        if driver is not None:
+            return driver
+        if attempt + 1 < attempts:
+            print(
+                f"ESP32 connect retry {attempt + 2}/{attempts} "
+                f"in {retry_delay_sec:.0f}s..."
+            )
+            time.sleep(retry_delay_sec)
+    return None
+
+
+def _create_servo_driver_once(cfg: RobotConfig) -> Optional[ServoDriver]:
     if not cfg.servo.enabled:
         return None
 

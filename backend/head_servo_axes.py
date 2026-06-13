@@ -4,7 +4,7 @@ Pan/tilt axis contract — must stay aligned across wiring, firmware, and Python
 | Axis | PCA9685 ch | USB serial | robottest | Face tracking        |
 |------|------------|------------|-----------|----------------------|
 | Pan  | 4          | P (degrees)| A / D     | norm_x → P command   |
-| Tilt | 5          | T (degrees)| W / S     | norm_y → T command   |
+| Tilt | 5          | T (degrees)| W / S     | face_norm_y × tilt_sign → T (lower T = down) |
 
 Firmware: firmware/head_servo/head_servo.ino (PAN_CH, TILT_CH)
 Config:   config.yaml servo.pan_ch / servo.tilt_ch (ServoKit + docs)

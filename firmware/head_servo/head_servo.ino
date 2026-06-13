@@ -638,7 +638,12 @@ void printTofMuxScan() {
 }
 
 bool readTofOnChannel(uint8_t idx) {
-  if (!tofMuxReady || idx >= TOF_SENSOR_COUNT || !tofSensorOk[idx]) {
+  if (!tofMuxReady || idx >= TOF_SENSOR_COUNT) {
+    tofDistanceMm[idx] = -1;
+    tofValid[idx] = false;
+    return false;
+  }
+  if (!tofSensorOk[idx] && !recoverVl53OnMux(idx)) {
     tofDistanceMm[idx] = -1;
     tofValid[idx] = false;
     return false;
@@ -903,6 +908,7 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
+  Wire.setTimeOut(50);
   Wire.beginTransmission(0x40);
   if (Wire.endTransmission() == 0) {
     pwm.begin();
@@ -912,7 +918,17 @@ void setup() {
   } else {
     Serial.println(F("WARN PCA9685 not found at 0x40"));
   }
-  initTofSensors();
+
+  for (uint8_t i = 0; i < TOF_SENSOR_COUNT; i++) {
+    tofSensorOk[i] = false;
+    tofDistanceMm[i] = -1;
+    tofValid[i] = false;
+  }
+  tofMuxReady = findTca9548Addr();
+  if (!tofMuxReady) {
+    Serial.println(F("WARN TCA9548A not found (0x70-0x77)"));
+  }
+
   // Servo pulses deferred until first P/T (reduces USB brownout on boot).
   panAngle = PAN_CENTER;
   tiltAngle = TILT_CENTER;
@@ -920,6 +936,8 @@ void setup() {
   lastCommandMs = millis();
   Serial.println(F("FW head_servo+tof"));
   Serial.println(F("READY"));
+  Serial.flush();
+  // VL53 sensors init lazily on first F poll (begin() can block a long time on I2C).
 }
 
 void loop() {

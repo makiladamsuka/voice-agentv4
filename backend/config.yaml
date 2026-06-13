@@ -11,6 +11,14 @@ display:
 
 camera:
   face_model_path: face_detection_yunet_2023mar.onnx
+  body_model_path: yolov8n.onnx
+  body_enabled: true
+  body_confidence_threshold: 0.35
+  body_nms_threshold: 0.45
+  body_input_size: 640
+  body_detect_stride: 2
+  body_track_servo_alpha: 0.30
+  body_aim_y_ratio: 0.22
   main_res: [1280, 720]
   detect_res: [640, 360]
   stream_res: [320, 180]
@@ -18,6 +26,10 @@ camera:
   nms_threshold: 0.3
   rotate_180: true
   stream_swap_rb: true
+  awb_mode: auto
+  colour_gains: null
+  stream_white_balance: false
+  stream_wb_strength: 0.55
 
 stream:
   enabled: true
@@ -48,6 +60,7 @@ eyes:
   look_side_offset: 16.0
   eye_head_ratio: 0.88
   eye_head_ratio_face: 0.38
+  eye_head_ratio_wander: 0.95
   eye_head_smooth_alpha: 0.14
   head_eye_pan_sign: 1.0
   head_eye_tilt_sign: -1.0
@@ -85,6 +98,7 @@ face_tracking:
   face_track_deadzone_x: 0.06
   face_track_deadzone_y: 0.07
   face_track_servo_alpha: 0.38
+  face_track_tilt_sign: -1.0
   face_present_hold_sec: 0.50
   face_absent_before_scan_sec: 1.0
   face_stable_before_track_sec: 0.6
@@ -99,25 +113,59 @@ face_tracking:
   no_face_wander_sec: 150.0
   wander_peek_min_sec: 5.0
   wander_peek_max_sec: 8.0
-  wander_peek_chance: 0.85
-  wander_search_pan_amp_deg: 18.0
-  wander_search_tilt_amp_deg: 12.0
-  wander_search_period_sec: 14.0
-  wander_search_tilt_phase_k: 1.3
+  wander_peek_chance: 0.55
+  wander_search_pan_amp_deg: 28.0
+  wander_search_pan_step_min_deg: 6.0
+  wander_search_pan_step_max_deg: 38.0
+  wander_search_hold_min_sec: 2.0
+  wander_search_hold_max_sec: 9.0
+  wander_search_thinking_hold_chance: 0.38
+  wander_search_thinking_hold_min_sec: 4.0
+  wander_search_thinking_hold_max_sec: 9.5
+  wander_search_long_stare_chance: 0.14
+  wander_search_jump_chance: 0.38
+  wander_search_arrival_deg: 2.0
+  wander_search_tilt_max_up_deg: 1.8
+  wander_search_tilt_max_down_deg: 3.5
+  wander_search_drift_min_vel: 4.0
+  wander_search_drift_max_vel: 11.0
+  wander_search_perturb_min_sec: 2.5
+  wander_search_perturb_max_sec: 7.0
+  wander_search_flip_chance: 0.32
+  wander_search_edge_slow_deg: 12.0
+  wander_search_tilt_recenter_alpha: 0.14
+  wander_side_look_pan_deg: 3.5
+  wander_search_tilt_amp_deg: 1.5
+  wander_search_period_sec: 22.0
+  wander_search_tilt_phase_k: 0.35
+  wander_search_ease_power: 2.0
+  wander_tilt_target_alpha: 0.038
+  wander_pan_target_alpha: 0.11
+  search_base_edge_deg: 6.0
+  search_base_nudge_deg: 1.5
+  search_base_cooldown_sec: 4.5
+  wander_base_follow_chance: 0.18
+  wander_base_follow_deg: 0.9
+  wander_base_follow_min_pan_deg: 6.0
+  wander_base_follow_min_drift_vel: 2.5
+  wander_base_follow_cooldown_sec: 10.0
+  wander_base_follow_eval_sec: 2.2
   sad_return_sec: 10.0
   sad_nod_tilt_deg: 10.0
   sad_nod_count: 2.0
   no_face_sad_recenter_alpha: 0.12
   wander_emotions:
-    - curious_intense
-    - uncertain
     - thinking
+    - concentrating
+    - uncertain
+    - curious_intense
     - attentive
     - curious
+    - remembering
   settled_sleepy_variety_min_sec: 20.0
   settled_sleepy_variety_max_sec: 40.0
   no_face_idle_pan_deg: 14.0
-  no_face_idle_tilt_deg: 10.0
+  no_face_idle_tilt_deg: 12.0
   no_face_idle_eye_x: 8.0
   no_face_idle_eye_y: 10.0
   chat_ready_recenter_alpha: 0.18
@@ -173,8 +221,8 @@ gaze:
   no_face_scan_trigger_chance: 0.55
   no_face_scan_retry_min_sec: 3.0
   no_face_scan_retry_max_sec: 7.0
-  no_face_scan_servo_pan_deg: 12.0
-  no_face_scan_servo_tilt_deg: 10.0
+  no_face_scan_servo_pan_deg: 8.0
+  no_face_scan_servo_tilt_deg: 3.0
   no_face_scan_tilt_phase: 0.35
   solo_upbeat_min_sec: 25.0
   social_release_min_sec: 20.0
@@ -193,20 +241,34 @@ gaze:
 servo:
   enabled: true
   backend: arduino
-  arduino_port: ""
+  arduino_port: /dev/ttyUSB0
   arduino_baud: 115200
   pan_ch: 4
   tilt_ch: 5
   pan_min: 40.0
-  pan_max: 130.0
-  tilt_min: 80.0
-  tilt_max: 130.0
+  pan_max: 120.0
+  tilt_min: 100.0
+  tilt_max: 120.0
   pulse_min: 450
   pulse_max: 2600
   smoothing: 0.10
   loop_delay: 0.01
   max_step_deg: 1.4
   deadzone_deg: 0.22
+  pan_max_vel: 18.0
+  pan_accel: 42.0
+  pan_decel: 58.0
+  pan_track_gain: 1.25
+  tilt_max_vel_up: 18.0
+  tilt_max_vel_down: 10.0
+  tilt_accel: 45.0
+  tilt_decel: 70.0
+  tilt_decel_down_mult: 1.85
+  head_vel_blend: 0.42
+  tilt_head_vel_blend: 0.14
+  tilt_track_gain: 2.4
+  goal_deadband_deg: 0.03
+  head_send_min_delta_deg: 0.025
   pan_track_range: 26.0
   tilt_track_range: 24.0
   target_filter_alpha: 0.30
@@ -229,6 +291,7 @@ base:
   enabled: true
   counts_per_degree: 37.855556
   max_relative_deg: 180.0
+  max_deg_from_zero: 20.0
   move_timeout_sec: 15.0
 
 tof:

@@ -6,6 +6,7 @@ Combines face tracking (YuNet) with dual SPI display output (ST7735).
 Optional: ESP32 pan/tilt face following via USB serial (PCA9685).
 """
 
+import signal
 import time
 import math
 import random
@@ -28,6 +29,14 @@ from robot_config import (
     save_config,
 )
 from servo_driver import create_servo_driver
+from elastic_head_motion import (
+    HeadMotionParams,
+    OrganicWanderSearch,
+    clamp,
+    scale_head_motion,
+    tick_toward,
+    wander_search_tilt_from_eye_level,
+)
 from head_servo_axes import check_servo_channel_config
 from tof_presence import TofPresenceTracker, TofSnapshot, TofPresence, sanitize_tof_snapshot
 from animation_player import AnimationPlayer
@@ -39,6 +48,8 @@ from botango_loader import (
     neutral_arm_degrees,
     servo_stop_pose,
 )
+from person_detector import PersonDetector
+from camera_color import PICAMERA_MAIN_FORMAT
 
 # Shared amplitude state written by the UDP thread, read by the render loop
 udp_emotion_override = None
@@ -71,6 +82,11 @@ except ImportError:
     print("Error: picamera2 not found. Please install with: sudo apt install python3-picamera2")
     sys.exit(1)
 
+try:
+    from libcamera import controls as libcamera_controls
+except ImportError:
+    libcamera_controls = None
+
 # --- Configuration (loaded from config.yaml) ---
 _cfg_path = Path(__file__).parent / "config.yaml"
 cfg = load_config(_cfg_path)
@@ -96,6 +112,14 @@ EYE_SIZE = _d.eye_size
 FLOOR_Y = SCREEN_HEIGHT - _d.floor_y_offset
 
 FACE_MODEL_PATH = _c.face_model_path
+BODY_MODEL_PATH = _c.body_model_path
+BODY_ENABLED = _c.body_enabled
+BODY_CONFIDENCE_THRESHOLD = _c.body_confidence_threshold
+BODY_NMS_THRESHOLD = _c.body_nms_threshold
+BODY_INPUT_SIZE = _c.body_input_size
+BODY_DETECT_STRIDE = _c.body_detect_stride
+BODY_TRACK_SERVO_ALPHA = _c.body_track_servo_alpha
+BODY_AIM_Y_RATIO = _c.body_aim_y_ratio
 CAMERA_MAIN_RES = tuple(_c.main_res)
 CAMERA_RES = tuple(_c.detect_res)
 STREAM_RES = tuple(_c.stream_res)
@@ -103,6 +127,10 @@ CONFIDENCE_THRESHOLD = _c.confidence_threshold
 NMS_THRESHOLD = _c.nms_threshold
 CAMERA_ROTATE_180 = _c.rotate_180
 STREAM_SWAP_RB = _c.stream_swap_rb
+CAMERA_AWB_MODE = _c.awb_mode
+CAMERA_COLOUR_GAINS = _c.colour_gains
+STREAM_WHITE_BALANCE = _c.stream_white_balance
+STREAM_WB_STRENGTH = _c.stream_wb_strength
 
 MAX_X_OFFSET = _e.max_x_offset
 MAX_Y_OFFSET = _e.max_y_offset
@@ -164,6 +192,7 @@ FACE_TRACK_SMOOTH_ALPHA_IDLE = _ft.face_track_smooth_alpha_idle
 FACE_TRACK_DEADZONE_X = _ft.face_track_deadzone_x
 FACE_TRACK_DEADZONE_Y = _ft.face_track_deadzone_y
 FACE_TRACK_SERVO_ALPHA = _ft.face_track_servo_alpha
+FACE_TRACK_TILT_SIGN = _ft.face_track_tilt_sign
 FACE_PRESENT_HOLD_SEC = _ft.face_present_hold_sec
 FACE_ABSENT_BEFORE_SCAN_SEC = _ft.face_absent_before_scan_sec
 FACE_STABLE_BEFORE_TRACK_SEC = _ft.face_stable_before_track_sec
@@ -175,9 +204,34 @@ WANDER_PEEK_MIN_SEC = _ft.wander_peek_min_sec
 WANDER_PEEK_MAX_SEC = _ft.wander_peek_max_sec
 WANDER_PEEK_CHANCE = _ft.wander_peek_chance
 WANDER_SEARCH_PAN_AMP_DEG = _ft.wander_search_pan_amp_deg
+WANDER_SEARCH_PAN_STEP_MIN_DEG = _ft.wander_search_pan_step_min_deg
+WANDER_SEARCH_PAN_STEP_MAX_DEG = _ft.wander_search_pan_step_max_deg
+WANDER_SEARCH_HOLD_MIN_SEC = _ft.wander_search_hold_min_sec
+WANDER_SEARCH_HOLD_MAX_SEC = _ft.wander_search_hold_max_sec
+WANDER_SEARCH_THINKING_HOLD_CHANCE = _ft.wander_search_thinking_hold_chance
+WANDER_SEARCH_THINKING_HOLD_MIN_SEC = _ft.wander_search_thinking_hold_min_sec
+WANDER_SEARCH_THINKING_HOLD_MAX_SEC = _ft.wander_search_thinking_hold_max_sec
+WANDER_SEARCH_LONG_STARE_CHANCE = _ft.wander_search_long_stare_chance
+WANDER_SEARCH_JUMP_CHANCE = _ft.wander_search_jump_chance
+WANDER_SEARCH_ARRIVAL_DEG = _ft.wander_search_arrival_deg
+WANDER_SEARCH_TILT_MAX_UP_DEG = _ft.wander_search_tilt_max_up_deg
+WANDER_SEARCH_TILT_MAX_DOWN_DEG = _ft.wander_search_tilt_max_down_deg
+WANDER_SEARCH_TILT_RECENTER_ALPHA = _ft.wander_search_tilt_recenter_alpha
+WANDER_SIDE_LOOK_PAN_DEG = _ft.wander_side_look_pan_deg
 WANDER_SEARCH_TILT_AMP_DEG = _ft.wander_search_tilt_amp_deg
-WANDER_SEARCH_PERIOD_SEC = _ft.wander_search_period_sec
-WANDER_SEARCH_TILT_PHASE_K = _ft.wander_search_tilt_phase_k
+WANDER_TILT_TARGET_ALPHA = _ft.wander_tilt_target_alpha
+WANDER_PAN_TARGET_ALPHA = _ft.wander_pan_target_alpha
+SEARCH_BASE_EDGE_DEG = _ft.search_base_edge_deg
+SEARCH_BASE_NUDGE_DEG = _ft.search_base_nudge_deg
+SEARCH_BASE_COOLDOWN_SEC = _ft.search_base_cooldown_sec
+WANDER_BASE_FOLLOW_CHANCE = _ft.wander_base_follow_chance
+WANDER_BASE_FOLLOW_DEG = _ft.wander_base_follow_deg
+WANDER_BASE_FOLLOW_MIN_PAN_DEG = _ft.wander_base_follow_min_pan_deg
+WANDER_BASE_FOLLOW_MIN_DRIFT_VEL = _ft.wander_base_follow_min_drift_vel
+WANDER_BASE_FOLLOW_COOLDOWN_SEC = _ft.wander_base_follow_cooldown_sec
+WANDER_BASE_FOLLOW_EVAL_SEC = _ft.wander_base_follow_eval_sec
+BASE_HOME_DEG = 0.0
+BASE_MAX_DEG_FROM_ZERO = _base.max_deg_from_zero
 SAD_RETURN_SEC = _ft.sad_return_sec
 SAD_NOD_TILT_DEG = _ft.sad_nod_tilt_deg
 SAD_NOD_COUNT = _ft.sad_nod_count
@@ -335,6 +389,8 @@ SMOOTHING = _sv.smoothing
 SERVO_LOOP_DELAY = _sv.loop_delay
 MAX_SERVO_STEP_DEG = _sv.max_step_deg
 SERVO_DEADZONE_DEG = _sv.deadzone_deg
+GOAL_DEADBAND_DEG = _sv.goal_deadband_deg
+HEAD_SEND_MIN_DELTA_DEG = _sv.head_send_min_delta_deg
 PAN_TRACK_RANGE = _sv.pan_track_range
 TILT_TRACK_RANGE = _sv.tilt_track_range
 TARGET_FILTER_ALPHA = _sv.target_filter_alpha
@@ -352,10 +408,12 @@ TALK_GESTURE_TILT_MULT_FACE = _sv.talk_gesture_tilt_mult_face
 TALK_GESTURE_TILT_MULT_NO_FACE = _sv.talk_gesture_tilt_mult_no_face
 FACE_TALK_PUNCH_SCALE = _sv.face_talk_punch_scale
 FACE_TALK_AF_THRESH = _sv.face_talk_af_thresh
+BASE_ENABLED = _base.enabled
 NO_FACE_RECENTER_SEC = _ft.no_face_recenter_sec
 NO_FACE_RECENTER_ALPHA = _ft.no_face_recenter_alpha
 EYE_HEAD_RATIO = _e.eye_head_ratio
 EYE_HEAD_RATIO_FACE = _e.eye_head_ratio_face
+EYE_HEAD_RATIO_WANDER = _e.eye_head_ratio_wander
 EYE_HEAD_SMOOTH_ALPHA = _e.eye_head_smooth_alpha
 HEAD_PAN_PX_PER_DEG = MAX_X_OFFSET / PAN_TRACK_RANGE
 HEAD_TILT_PX_PER_DEG = MAX_Y_OFFSET / TILT_TRACK_RANGE
@@ -366,6 +424,33 @@ JERK_AMPLITUDE = _e.jerk_amplitude
 JERK_DURATION = _e.jerk_duration
 
 _config_lock = threading.Lock()
+
+
+def _head_motion_params_from_servo(sv) -> tuple[HeadMotionParams, HeadMotionParams]:
+    pan = HeadMotionParams(
+        max_vel_pos=float(sv.pan_max_vel),
+        max_vel_neg=float(sv.pan_max_vel),
+        accel=float(sv.pan_accel),
+        decel=float(sv.pan_decel),
+        vel_blend=float(sv.head_vel_blend),
+        goal_deadband_deg=float(sv.goal_deadband_deg),
+        track_gain=float(getattr(sv, "pan_track_gain", 0.0)),
+    )
+    tilt = HeadMotionParams(
+        max_vel_pos=float(sv.tilt_max_vel_up),
+        max_vel_neg=float(sv.tilt_max_vel_down),
+        accel=float(sv.tilt_accel),
+        decel=float(sv.tilt_decel),
+        vel_blend=float(getattr(sv, "tilt_head_vel_blend", sv.head_vel_blend)),
+        decel_boost_dir=-1.0,
+        decel_boost_mult=float(sv.tilt_decel_down_mult),
+        goal_deadband_deg=float(sv.goal_deadband_deg),
+        track_gain=float(getattr(sv, "tilt_track_gain", 2.2)),
+    )
+    return pan, tilt
+
+
+PAN_MOTION, TILT_MOTION = _head_motion_params_from_servo(_sv)
 
 VALID_CONV_STATES = frozenset({
     "listening", "thinking", "nodding", "remembering",
@@ -392,12 +477,25 @@ def sync_config_from_cfg() -> None:
     global SPEAK_SOCIAL_MIN_SEC, SPEAK_SOCIAL_MAX_SEC, CONNECTED_SOLO_EMOTIONS, LAZY_EMOTIONS
     global FACE_TRACK_INTENSITY, FACE_TRACK_SMOOTH_ALPHA, FACE_TRACK_SMOOTH_ALPHA_IDLE
     global FACE_TRACK_DEADZONE_X, FACE_TRACK_DEADZONE_Y, FACE_TRACK_SERVO_ALPHA
+    global FACE_TRACK_TILT_SIGN
     global FACE_PRESENT_HOLD_SEC, FACE_ABSENT_BEFORE_SCAN_SEC, FACE_STABLE_BEFORE_TRACK_SEC
     global FACE_ACQUIRE_SNAP_ALPHA, FACE_ACQUIRE_SNAP_DURATION_SEC
     global FACE_SCAN_COOLDOWN_AFTER_LOCK_SEC, NO_FACE_WANDER_SEC
     global WANDER_PEEK_MIN_SEC, WANDER_PEEK_MAX_SEC, WANDER_PEEK_CHANCE
-    global WANDER_SEARCH_PAN_AMP_DEG, WANDER_SEARCH_TILT_AMP_DEG, WANDER_SEARCH_PERIOD_SEC
-    global WANDER_SEARCH_TILT_PHASE_K, SAD_RETURN_SEC, SAD_NOD_TILT_DEG, SAD_NOD_COUNT
+    global WANDER_SEARCH_PAN_AMP_DEG, WANDER_SEARCH_PAN_STEP_MIN_DEG, WANDER_SEARCH_PAN_STEP_MAX_DEG
+    global WANDER_SEARCH_HOLD_MIN_SEC, WANDER_SEARCH_HOLD_MAX_SEC, WANDER_SEARCH_JUMP_CHANCE
+    global WANDER_SEARCH_THINKING_HOLD_CHANCE, WANDER_SEARCH_THINKING_HOLD_MIN_SEC
+    global WANDER_SEARCH_THINKING_HOLD_MAX_SEC, WANDER_SEARCH_LONG_STARE_CHANCE
+    global WANDER_SEARCH_ARRIVAL_DEG, WANDER_SEARCH_TILT_MAX_UP_DEG, WANDER_SEARCH_TILT_MAX_DOWN_DEG
+    global WANDER_SEARCH_TILT_RECENTER_ALPHA, WANDER_SIDE_LOOK_PAN_DEG
+    global WANDER_SEARCH_TILT_AMP_DEG
+    global WANDER_TILT_TARGET_ALPHA, WANDER_PAN_TARGET_ALPHA
+    global SEARCH_BASE_EDGE_DEG, SEARCH_BASE_NUDGE_DEG, SEARCH_BASE_COOLDOWN_SEC
+    global WANDER_BASE_FOLLOW_CHANCE, WANDER_BASE_FOLLOW_DEG
+    global WANDER_BASE_FOLLOW_MIN_PAN_DEG, WANDER_BASE_FOLLOW_MIN_DRIFT_VEL
+    global WANDER_BASE_FOLLOW_COOLDOWN_SEC, WANDER_BASE_FOLLOW_EVAL_SEC
+    global BASE_MAX_DEG_FROM_ZERO
+    global SAD_RETURN_SEC, SAD_NOD_TILT_DEG, SAD_NOD_COUNT
     global NO_FACE_SAD_RECENTER_ALPHA, WANDER_EMOTIONS
     global SETTLED_SLEEPY_VARIETY_MIN_SEC, SETTLED_SLEEPY_VARIETY_MAX_SEC
     global NO_FACE_IDLE_PAN_DEG, NO_FACE_IDLE_TILT_DEG, NO_FACE_IDLE_EYE_X, NO_FACE_IDLE_EYE_Y
@@ -412,6 +510,8 @@ def sync_config_from_cfg() -> None:
     global GAZE_RELEASE_X, GAZE_RELEASE_Y, GAZE_SERVO_PAN_PER_PX, GAZE_SERVO_TILT_PER_PX
     global STREAM_FPS, STREAM_JPEG_QUALITY, RENDER_FPS, VISION_FPS, ENABLE_SERVO
     global SMOOTHING, SERVO_LOOP_DELAY, MAX_SERVO_STEP_DEG, SERVO_DEADZONE_DEG
+    global GOAL_DEADBAND_DEG, PAN_MOTION, TILT_MOTION, BASE_ENABLED
+    global HEAD_SEND_MIN_DELTA_DEG
     global PAN_TRACK_RANGE, TILT_TRACK_RANGE, TARGET_FILTER_ALPHA
     global TRACK_DAMP_ALPHA_SCALE, TRACK_DAMP_SLOW_THRESH, TRACK_DAMP_FAST_THRESH
     global CONV_NOD_DEG, CONV_NOD_HZ, CONV_THINK_BOB_DEG, CONV_THINK_BOB_HZ
@@ -419,11 +519,14 @@ def sync_config_from_cfg() -> None:
     global TALK_GESTURE_TILT_MULT_FACE, TALK_GESTURE_TILT_MULT_NO_FACE
     global FACE_TALK_PUNCH_SCALE, FACE_TALK_AF_THRESH
     global NO_FACE_RECENTER_SEC, NO_FACE_RECENTER_ALPHA
-    global EYE_HEAD_RATIO, EYE_HEAD_RATIO_FACE, EYE_HEAD_SMOOTH_ALPHA
+    global EYE_HEAD_RATIO, EYE_HEAD_RATIO_FACE, EYE_HEAD_RATIO_WANDER, EYE_HEAD_SMOOTH_ALPHA
     global HEAD_PAN_PX_PER_DEG, HEAD_TILT_PX_PER_DEG
     global HEAD_EYE_PAN_SIGN, HEAD_EYE_TILT_SIGN, SLEEP_TILT_DEG
     global JERK_AMPLITUDE, JERK_DURATION
     global CONFIDENCE_THRESHOLD, NMS_THRESHOLD, CAMERA_ROTATE_180, STREAM_SWAP_RB
+    global CAMERA_AWB_MODE, CAMERA_COLOUR_GAINS, STREAM_WHITE_BALANCE, STREAM_WB_STRENGTH
+    global BODY_MODEL_PATH, BODY_ENABLED, BODY_CONFIDENCE_THRESHOLD, BODY_NMS_THRESHOLD
+    global BODY_INPUT_SIZE, BODY_DETECT_STRIDE, BODY_TRACK_SERVO_ALPHA, BODY_AIM_Y_RATIO
 
     _e = cfg.eyes
     _db = cfg.debug
@@ -491,6 +594,7 @@ def sync_config_from_cfg() -> None:
     FACE_TRACK_DEADZONE_X = _ft.face_track_deadzone_x
     FACE_TRACK_DEADZONE_Y = _ft.face_track_deadzone_y
     FACE_TRACK_SERVO_ALPHA = _ft.face_track_servo_alpha
+    FACE_TRACK_TILT_SIGN = _ft.face_track_tilt_sign
     FACE_PRESENT_HOLD_SEC = _ft.face_present_hold_sec
     FACE_ABSENT_BEFORE_SCAN_SEC = _ft.face_absent_before_scan_sec
     FACE_STABLE_BEFORE_TRACK_SEC = _ft.face_stable_before_track_sec
@@ -502,9 +606,32 @@ def sync_config_from_cfg() -> None:
     WANDER_PEEK_MAX_SEC = _ft.wander_peek_max_sec
     WANDER_PEEK_CHANCE = _ft.wander_peek_chance
     WANDER_SEARCH_PAN_AMP_DEG = _ft.wander_search_pan_amp_deg
+    WANDER_SEARCH_PAN_STEP_MIN_DEG = _ft.wander_search_pan_step_min_deg
+    WANDER_SEARCH_PAN_STEP_MAX_DEG = _ft.wander_search_pan_step_max_deg
+    WANDER_SEARCH_HOLD_MIN_SEC = _ft.wander_search_hold_min_sec
+    WANDER_SEARCH_HOLD_MAX_SEC = _ft.wander_search_hold_max_sec
+    WANDER_SEARCH_THINKING_HOLD_CHANCE = _ft.wander_search_thinking_hold_chance
+    WANDER_SEARCH_THINKING_HOLD_MIN_SEC = _ft.wander_search_thinking_hold_min_sec
+    WANDER_SEARCH_THINKING_HOLD_MAX_SEC = _ft.wander_search_thinking_hold_max_sec
+    WANDER_SEARCH_LONG_STARE_CHANCE = _ft.wander_search_long_stare_chance
+    WANDER_SEARCH_JUMP_CHANCE = _ft.wander_search_jump_chance
+    WANDER_SEARCH_ARRIVAL_DEG = _ft.wander_search_arrival_deg
+    WANDER_SEARCH_TILT_MAX_UP_DEG = _ft.wander_search_tilt_max_up_deg
+    WANDER_SEARCH_TILT_MAX_DOWN_DEG = _ft.wander_search_tilt_max_down_deg
+    WANDER_SEARCH_TILT_RECENTER_ALPHA = _ft.wander_search_tilt_recenter_alpha
+    WANDER_SIDE_LOOK_PAN_DEG = _ft.wander_side_look_pan_deg
     WANDER_SEARCH_TILT_AMP_DEG = _ft.wander_search_tilt_amp_deg
-    WANDER_SEARCH_PERIOD_SEC = _ft.wander_search_period_sec
-    WANDER_SEARCH_TILT_PHASE_K = _ft.wander_search_tilt_phase_k
+    WANDER_TILT_TARGET_ALPHA = _ft.wander_tilt_target_alpha
+    WANDER_PAN_TARGET_ALPHA = _ft.wander_pan_target_alpha
+    SEARCH_BASE_EDGE_DEG = _ft.search_base_edge_deg
+    SEARCH_BASE_NUDGE_DEG = _ft.search_base_nudge_deg
+    SEARCH_BASE_COOLDOWN_SEC = _ft.search_base_cooldown_sec
+    WANDER_BASE_FOLLOW_CHANCE = _ft.wander_base_follow_chance
+    WANDER_BASE_FOLLOW_DEG = _ft.wander_base_follow_deg
+    WANDER_BASE_FOLLOW_MIN_PAN_DEG = _ft.wander_base_follow_min_pan_deg
+    WANDER_BASE_FOLLOW_MIN_DRIFT_VEL = _ft.wander_base_follow_min_drift_vel
+    WANDER_BASE_FOLLOW_COOLDOWN_SEC = _ft.wander_base_follow_cooldown_sec
+    WANDER_BASE_FOLLOW_EVAL_SEC = _ft.wander_base_follow_eval_sec
     SAD_RETURN_SEC = _ft.sad_return_sec
     SAD_NOD_TILT_DEG = _ft.sad_nod_tilt_deg
     SAD_NOD_COUNT = _ft.sad_nod_count
@@ -557,6 +684,11 @@ def sync_config_from_cfg() -> None:
     SERVO_LOOP_DELAY = _sv.loop_delay
     MAX_SERVO_STEP_DEG = _sv.max_step_deg
     SERVO_DEADZONE_DEG = _sv.deadzone_deg
+    GOAL_DEADBAND_DEG = _sv.goal_deadband_deg
+    BASE_ENABLED = cfg.base.enabled
+    BASE_MAX_DEG_FROM_ZERO = cfg.base.max_deg_from_zero
+    PAN_MOTION, TILT_MOTION = _head_motion_params_from_servo(_sv)
+    HEAD_SEND_MIN_DELTA_DEG = _sv.head_send_min_delta_deg
     PAN_TRACK_RANGE = _sv.pan_track_range
     TILT_TRACK_RANGE = _sv.tilt_track_range
     TARGET_FILTER_ALPHA = _sv.target_filter_alpha
@@ -578,6 +710,7 @@ def sync_config_from_cfg() -> None:
     NO_FACE_RECENTER_ALPHA = _ft.no_face_recenter_alpha
     EYE_HEAD_RATIO = _e.eye_head_ratio
     EYE_HEAD_RATIO_FACE = _e.eye_head_ratio_face
+    EYE_HEAD_RATIO_WANDER = _e.eye_head_ratio_wander
     EYE_HEAD_SMOOTH_ALPHA = _e.eye_head_smooth_alpha
     HEAD_PAN_PX_PER_DEG = MAX_X_OFFSET / PAN_TRACK_RANGE
     HEAD_TILT_PX_PER_DEG = MAX_Y_OFFSET / TILT_TRACK_RANGE
@@ -590,6 +723,18 @@ def sync_config_from_cfg() -> None:
     NMS_THRESHOLD = _c.nms_threshold
     CAMERA_ROTATE_180 = _c.rotate_180
     STREAM_SWAP_RB = _c.stream_swap_rb
+    CAMERA_AWB_MODE = _c.awb_mode
+    CAMERA_COLOUR_GAINS = _c.colour_gains
+    STREAM_WHITE_BALANCE = _c.stream_white_balance
+    STREAM_WB_STRENGTH = _c.stream_wb_strength
+    BODY_MODEL_PATH = _c.body_model_path
+    BODY_ENABLED = _c.body_enabled
+    BODY_CONFIDENCE_THRESHOLD = _c.body_confidence_threshold
+    BODY_NMS_THRESHOLD = _c.body_nms_threshold
+    BODY_INPUT_SIZE = _c.body_input_size
+    BODY_DETECT_STRIDE = _c.body_detect_stride
+    BODY_TRACK_SERVO_ALPHA = _c.body_track_servo_alpha
+    BODY_AIM_Y_RATIO = _c.body_aim_y_ratio
 
     if "detector" in globals() and detector is not None:
         try:
@@ -1352,6 +1497,41 @@ except Exception as e:
     print(f"Error init Right Display (SPI1): {e}")
 
 
+# Connect ESP32 before Picamera2 — shared USB bus on Pi can block boot/handshake.
+_boot_servo_driver = None
+if ENABLE_SERVO:
+    print("Connecting ESP32 (before camera USB)...")
+    check_servo_channel_config(cfg.servo.pan_ch, cfg.servo.tilt_ch, backend=cfg.servo.backend)
+    _boot_servo_driver = create_servo_driver(cfg, max_attempts=4, retry_delay_sec=2.0)
+
+
+def _apply_camera_colour_controls(picam2: Picamera2) -> None:
+    """Set AWB / manual colour gains to reduce orange indoor cast."""
+    if libcamera_controls is None:
+        return
+    awb_modes = {
+        "auto": libcamera_controls.AwbModeEnum.Auto,
+        "daylight": libcamera_controls.AwbModeEnum.Daylight,
+        "cloudy": libcamera_controls.AwbModeEnum.Cloudy,
+        "tungsten": libcamera_controls.AwbModeEnum.Tungsten,
+        "fluorescent": libcamera_controls.AwbModeEnum.Fluorescent,
+        "incandescent": libcamera_controls.AwbModeEnum.Incandescent,
+        "indoor": libcamera_controls.AwbModeEnum.Indoor,
+    }
+    ctrl: dict = {}
+    if CAMERA_COLOUR_GAINS and len(CAMERA_COLOUR_GAINS) >= 2:
+        ctrl["AwbEnable"] = False
+        ctrl["ColourGains"] = (float(CAMERA_COLOUR_GAINS[0]), float(CAMERA_COLOUR_GAINS[1]))
+    else:
+        mode = awb_modes.get(str(CAMERA_AWB_MODE).lower(), libcamera_controls.AwbModeEnum.Auto)
+        ctrl["AwbMode"] = mode
+    try:
+        picam2.set_controls(ctrl)
+        print(f"Camera colour: {ctrl}")
+    except Exception as e:
+        print(f"Warning: camera colour controls not applied: {e}")
+
+
 # --- Camera & Face Detector Setup ---
 print("Initializing Picamera2...")
 picam2 = None
@@ -1359,11 +1539,12 @@ try:
     picam2 = Picamera2()
     
     config = picam2.create_video_configuration(
-        main={"format": "RGB888", "size": CAMERA_MAIN_RES},
+        main={"format": PICAMERA_MAIN_FORMAT, "size": CAMERA_MAIN_RES},
         buffer_count=1,
     )
     picam2.configure(config)
     picam2.start()
+    _apply_camera_colour_controls(picam2)
     print(f"Camera started: main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, detect {CAMERA_RES[0]}x{CAMERA_RES[1]}")
 except Exception as e:
     print(f"Error starting Picamera2: {e}")
@@ -1390,6 +1571,25 @@ except Exception as e:
     print(f"Error initializing detector: {e}")
     sys.exit(1)
 
+person_detector = None
+if BODY_ENABLED:
+    print("Initializing YOLOv8 person detector...")
+    try:
+        if not Path(BODY_MODEL_PATH).exists():
+            print(f"Warning: Body model not found at {BODY_MODEL_PATH}")
+            print("  Run: python tools/download_models.py yolov8n.onnx")
+        else:
+            person_detector = PersonDetector(
+                BODY_MODEL_PATH,
+                confidence_threshold=BODY_CONFIDENCE_THRESHOLD,
+                nms_threshold=BODY_NMS_THRESHOLD,
+                input_size=BODY_INPUT_SIZE,
+            )
+            print("YOLOv8 person detector initialized.")
+    except Exception as e:
+        print(f"Warning: Person detector disabled: {e}")
+        person_detector = None
+
 
 # --- Eye Objects ---
 center_x = SCREEN_WIDTH / 2
@@ -1407,6 +1607,7 @@ right_eye.set_emotion("idle", EMOTION_INTENSITY["idle"])
 
 # Animation Loop Vars
 running = True
+servo_running = False
 next_blink_time = time.time() + random.uniform(3, 6)
 last_blink_time = time.time()
 smoothed_x_off = 0.0
@@ -1445,19 +1646,24 @@ target_y_off = 0.0
 target_rotation = 0.0
 target_squint = 0.0
 target_face_present = False
+target_body_present = False
 target_face_area_ratio = 0.0
 target_face_count = 0
 squint_until = 0.0
 
 # Servo shared state
 servo_state_lock = threading.Lock()
-servo_running = False
 servo_thread = None
 servo_driver = None
 servo_target_pan = (PAN_MIN + PAN_MAX) * 0.5
 servo_target_tilt = (TILT_MIN + TILT_MAX) * 0.5
 servo_current_pan = servo_target_pan
 servo_current_tilt = servo_target_tilt
+servo_pan_vel = 0.0
+servo_tilt_vel = 0.0
+last_base_fov_nudge_ts = 0.0
+last_wander_base_follow_ts = 0.0
+last_wander_base_follow_eval_ts = 0.0
 last_face_seen_ts = time.time()
 _pan_center_init = (PAN_MIN + PAN_MAX) * 0.5
 _tilt_center_init = (TILT_MIN + TILT_MAX) * 0.5
@@ -1475,11 +1681,17 @@ chat_ready_until = 0.0
 wake_tilt_jerk_until = 0.0
 wake_request_ts = 0.0
 session_active = False
-wander_search_phase = 0.0
+wander_search_phase = 0.0  # legacy
 wander_search_last_ts = time.time()
+organic_wander_search = OrganicWanderSearch()
+search_tilt_from_eye_level_deg = 0.0
+wander_pan_speed_scale = 1.0
 ever_had_face = False
 pending_face_stable_since = None
 router_face_stable_prev = False
+_last_body_det = None
+_last_body_det_ts = 0.0
+vision_frame_idx = 0
 settled_solo_emotion = "sleepy"
 settled_emotion_until = 0.0
 speak_social_mode = "engaged"
@@ -1525,12 +1737,14 @@ neutral_arm_targets: dict[str, float] = dict(DEFAULT_ARM_NEUTRALS)
 animation_arm_targets: dict[str, float] = dict(neutral_arm_targets)
 arm_current_smoothed: dict[str, float] = dict(neutral_arm_targets)
 _last_servo_frame_ts = 0.0
+_last_sent_pan: float | None = None
+_last_sent_tilt: float | None = None
 SERVO_FRAME_INTERVAL = 1.0 / 30.0
 ARM_ANIM_BLEND = 0.45
 BOTANGO_COMMANDS_FILE = "AnimationCommands.json"
 
 tof_lock = threading.Lock()
-tof_snapshot = TofSnapshot(-1, -1, -1)
+tof_snapshot = TofSnapshot.empty()
 tof_presence = TofPresence(False, False, False, False, 0)
 tof_tracker = TofPresenceTracker(
     present_max_mm=TOF_PRESENT_MAX_MM,
@@ -1635,11 +1849,11 @@ def start_wander_peek():
         sx = random.choice([-1.0, 1.0])
     else:
         sx = 1.0 if last_face_norm_x >= 0.0 else -1.0
-    tilt_sign = random.choice([-1.0, 1.0])
+    tilt_sign = -1.0 if random.random() < 0.75 else 1.0
     start_gaze_event(
         "AVERT_SCAN",
         sx * random.uniform(GAZE_SCAN_X * 0.55, GAZE_SCAN_X * 0.85),
-        tilt_sign * random.uniform(GAZE_SCAN_Y * 0.45, GAZE_SCAN_Y * 0.75),
+        tilt_sign * random.uniform(GAZE_SCAN_Y * 0.05, GAZE_SCAN_Y * 0.20),
         to_sec=0.45,
         hold_sec=random.uniform(0.6, 1.0),
         back_sec=0.45,
@@ -1759,6 +1973,238 @@ def head_center_angles() -> tuple[float, float]:
     return (PAN_MIN + PAN_MAX) * 0.5, (TILT_MIN + TILT_MAX) * 0.5
 
 
+def _tilt_down_from_center(offset_deg: float) -> float:
+    """Lower servo tilt = head down (toward TILT_MIN)."""
+    _, tilt_center = head_center_angles()
+    return clamp(tilt_center - abs(offset_deg), TILT_MIN, TILT_MAX)
+
+
+def _apply_detection_aim_point(
+    aim_cx: float,
+    aim_cy: float,
+    *,
+    servo_alpha: float,
+) -> tuple[float, float, float, float, float | None, float | None]:
+    """Map detect-frame pixel aim point to eye offsets and optional servo targets."""
+    global servo_target_pan, servo_target_tilt
+    global last_face_pan, last_face_tilt, last_face_norm_x, last_face_norm_y
+
+    norm_x = -((aim_cx / CAMERA_RES[0] - 0.5) * 2.0)
+    # Match main branch: face lower in frame -> look down.
+    norm_y = -((aim_cy / CAMERA_RES[1] - 0.5) * 2.0)
+    norm_x = apply_deadzone_norm(norm_x, FACE_TRACK_DEADZONE_X)
+    norm_y = apply_deadzone_norm(norm_y, FACE_TRACK_DEADZONE_Y)
+
+    local_x = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, norm_x * MAX_X_OFFSET))
+    local_y = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, norm_y * MAX_Y_OFFSET))
+
+    mapped_pan = None
+    mapped_tilt = None
+    if ENABLE_SERVO and servo_driver is not None:
+        pan_center = (PAN_MIN + PAN_MAX) * 0.5
+        tilt_center = (TILT_MIN + TILT_MAX) * 0.5
+        mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
+        mapped_tilt = clamp(
+            tilt_center + (norm_y * TILT_TRACK_RANGE), TILT_MIN, TILT_MAX
+        )
+        with servo_state_lock:
+            servo_target_pan = servo_target_pan + (mapped_pan - servo_target_pan) * servo_alpha
+            servo_target_tilt = servo_target_tilt + (mapped_tilt - servo_target_tilt) * servo_alpha
+            last_face_pan = mapped_pan
+            last_face_tilt = mapped_tilt
+            last_face_norm_x = norm_x
+            last_face_norm_y = norm_y
+
+    return local_x, local_y, norm_x, norm_y, mapped_pan, mapped_tilt
+
+
+def _maybe_search_base_fov_nudge(
+    pan_current: float,
+    *,
+    face_locked: bool,
+    mode: str,
+) -> None:
+    """Small base rotation when pan nears limit during no-face search."""
+    global last_base_fov_nudge_ts, servo_target_pan
+
+    if (
+        not BASE_ENABLED
+        or servo_driver is None
+        or face_locked
+        or mode != "wandering"
+    ):
+        return
+    if not hasattr(servo_driver, "write_base_relative_clamped"):
+        return
+
+    now = time.time()
+    if now - last_base_fov_nudge_ts < SEARCH_BASE_COOLDOWN_SEC:
+        return
+
+    dist_min = pan_current - PAN_MIN
+    dist_max = PAN_MAX - pan_current
+    nudge_deg = 0.0
+    if dist_max <= SEARCH_BASE_EDGE_DEG:
+        nudge_deg = -SEARCH_BASE_NUDGE_DEG
+    elif dist_min <= SEARCH_BASE_EDGE_DEG:
+        nudge_deg = SEARCH_BASE_NUDGE_DEG
+    else:
+        return
+
+    _apply_wander_base_nudge(nudge_deg, now)
+
+
+def _apply_wander_base_nudge(nudge_deg: float, now: float) -> bool:
+    """Send async base nudge and softly compensate head pan target."""
+    global last_base_fov_nudge_ts, servo_target_pan
+
+    if abs(nudge_deg) < 0.2:
+        return False
+    try:
+        st = servo_driver.query_base_status()
+        if st is not None and st.busy:
+            return False
+        ok = servo_driver.write_base_relative_clamped(
+            nudge_deg,
+            max_from_zero=BASE_MAX_DEG_FROM_ZERO,
+            wait=False,
+        )
+        if not ok:
+            return False
+        last_base_fov_nudge_ts = now
+        pan_center = (PAN_MIN + PAN_MAX) * 0.5
+        with servo_state_lock:
+            compensated = clamp(
+                servo_target_pan - nudge_deg,
+                PAN_MIN,
+                PAN_MAX,
+            )
+            if abs(compensated - pan_center) < SEARCH_BASE_NUDGE_DEG:
+                compensated = pan_center
+            servo_target_pan += (
+                compensated - servo_target_pan
+            ) * WANDER_PAN_TARGET_ALPHA
+        return True
+    except Exception as e:
+        print(f"Base wander nudge failed: {e}")
+        return False
+
+
+def _maybe_wander_base_follow_nudge(
+    pan_current: float,
+    *,
+    face_locked: bool,
+    mode: str,
+) -> None:
+    """Occasionally rotate base slightly in the direction the head is drifting."""
+    global last_wander_base_follow_ts, last_wander_base_follow_eval_ts
+
+    if (
+        not BASE_ENABLED
+        or servo_driver is None
+        or face_locked
+        or mode != "wandering"
+    ):
+        return
+    if not hasattr(servo_driver, "write_base_relative_clamped"):
+        return
+
+    now = time.time()
+    if now - last_wander_base_follow_eval_ts < WANDER_BASE_FOLLOW_EVAL_SEC:
+        return
+    last_wander_base_follow_eval_ts = now
+
+    if now - last_wander_base_follow_ts < WANDER_BASE_FOLLOW_COOLDOWN_SEC:
+        return
+    if now - last_base_fov_nudge_ts < 2.5:
+        return
+
+    drift_vel = organic_wander_search.drift_vel
+    if abs(drift_vel) < WANDER_BASE_FOLLOW_MIN_DRIFT_VEL:
+        return
+
+    pan_center = (PAN_MIN + PAN_MAX) * 0.5
+    head_pan = pan_current - pan_center
+    if abs(head_pan) < WANDER_BASE_FOLLOW_MIN_PAN_DEG:
+        return
+    if random.random() > WANDER_BASE_FOLLOW_CHANCE:
+        return
+
+    # Same sign convention as FOV edge nudge: drift right → negative base cmd.
+    nudge_deg = -WANDER_BASE_FOLLOW_DEG if drift_vel > 0 else WANDER_BASE_FOLLOW_DEG
+    if _apply_wander_base_nudge(nudge_deg, now):
+        last_wander_base_follow_ts = now
+
+
+def _servo_home_frame() -> dict[str, float]:
+    pan_home, tilt_home = head_center_angles()
+    pose = servo_stop_pose(neutral_arm_targets)
+    return {
+        "P": pan_home,
+        "T": tilt_home,
+        "A0=": pose["arm_0"],
+        "A1=": pose["arm_1"],
+        "A2=": pose["arm_2"],
+        "A3=": pose["arm_3"],
+    }
+
+
+def _home_servos_on_shutdown() -> None:
+    """Move head + arms to neutral, then release the serial link."""
+    global animation_arm_targets, arm_current_smoothed
+    if servo_driver is None:
+        return
+    with animation_lock:
+        animation_player.stop()
+        animation_arm_targets = dict(neutral_arm_targets)
+        arm_current_smoothed = dict(neutral_arm_targets)
+    pan_home, tilt_home = head_center_angles()
+    arms = dict(neutral_arm_targets)
+    homed = False
+    try:
+        if BASE_ENABLED and hasattr(servo_driver, "write_base_stop"):
+            servo_driver.write_base_stop()
+        if BASE_ENABLED and hasattr(servo_driver, "write_base_absolute"):
+            try:
+                servo_driver.write_base_absolute(BASE_HOME_DEG, wait=True)
+                print(f"Base homed to {BASE_HOME_DEG:.1f}°")
+            except Exception as e:
+                print(f"Base home failed: {e}")
+        if hasattr(servo_driver, "write_home_pose"):
+            homed = servo_driver.write_home_pose(
+                pan_home, tilt_home, arms, wait_ack=True
+            )
+        elif hasattr(servo_driver, "write_servo_frame"):
+            homed = servo_driver.write_servo_frame(_servo_home_frame(), wait_ack=True)
+        else:
+            try:
+                homed = servo_driver.write_angles(pan_home, tilt_home, force=True)
+            except TypeError:
+                homed = servo_driver.write_angles(pan_home, tilt_home)
+        if homed:
+            time.sleep(0.35)
+            print(
+                f"Servos homed: P={pan_home:.1f} T={tilt_home:.1f} "
+                f"arms {arms['arm_0']:.0f}/{arms['arm_1']:.0f}/"
+                f"{arms['arm_2']:.0f}/{arms['arm_3']:.0f} deg"
+            )
+    except Exception as e:
+        print(f"Servo home failed: {e}")
+    try:
+        servo_driver.close(
+            home_pan=pan_home,
+            home_tilt=tilt_home,
+            arm_neutrals=arms,
+            skip_home=homed,
+        )
+        print("Serial closed.")
+    except TypeError:
+        servo_driver.close(home_pan=pan_home, home_tilt=tilt_home)
+        print("Serial closed.")
+    except Exception as e:
+        print(e)
+
+
 def _blend_track(base: float, sample_value: float, mode: str, weight: float) -> float:
     w = max(0.0, min(1.0, float(weight)))
     if str(mode).lower() == "override":
@@ -1824,6 +2270,7 @@ def tof_worker():
     if not TOF_ENABLED or servo_driver is None:
         return
     interval = 1.0 / max(0.5, float(TOF_POLL_HZ))
+    last_error_log = 0.0
     while running:
         try:
             snap = servo_driver.poll_tof()
@@ -1837,15 +2284,19 @@ def tof_worker():
                     tof_snapshot = snap
                     tof_presence = presence
         except Exception as e:
-            print(f"ToF poll error: {e}")
+            now = time.time()
+            if now - last_error_log > 5.0:
+                print(f"ToF poll error: {e}")
+                last_error_log = now
         time.sleep(interval)
 
 
 def servo_worker():
-    global servo_current_pan, servo_current_tilt, servo_running, jerk_until, jerk_direction
+    global servo_current_pan, servo_current_tilt, servo_pan_vel, servo_tilt_vel
+    global servo_running, jerk_until, jerk_direction
     global amplitude_fast, amplitude_slow, udp_speak_pulse, udp_conv_state
     global current_emotion, gaze_event_active, no_face_mode, sad_return_start, wake_tilt_jerk_until
-    global animation_arm_targets, arm_current_smoothed, _last_servo_frame_ts
+    global animation_arm_targets, arm_current_smoothed, _last_servo_frame_ts, wander_pan_speed_scale
     if servo_driver is None:
         return
 
@@ -1875,7 +2326,18 @@ def servo_worker():
         # Conversation-state nods — not while face locked, sad return, or settled idle.
         conv_tilt = 0.0
         if not face_locked and no_face_mode in ("wandering", "chat_ready"):
-            if udp_conv_state == "nodding":
+            if (
+                no_face_mode == "wandering"
+                and not organic_wander_search.moving
+                and organic_wander_search.pause_kind in ("thinking", "long_stare")
+            ):
+                bob_scale = 1.15 if organic_wander_search.pause_kind == "thinking" else 0.82
+                conv_tilt = (
+                    math.sin(now * CONV_THINK_BOB_HZ * math.tau)
+                    * CONV_THINK_BOB_DEG
+                    * bob_scale
+                )
+            elif udp_conv_state == "nodding":
                 conv_tilt = math.sin(now * CONV_NOD_HZ * math.tau) * CONV_NOD_DEG
             elif udp_conv_state in ("thinking", "concentrating", "remembering"):
                 conv_tilt = math.sin(now * CONV_THINK_BOB_HZ * math.tau) * CONV_THINK_BOB_DEG
@@ -1907,7 +2369,7 @@ def servo_worker():
 
         sleep_tilt = 0.0
         if current_emotion == "sleepy" and not gaze_event_active:
-            sleep_tilt = SLEEP_TILT_DEG
+            sleep_tilt = -abs(SLEEP_TILT_DEG)
 
         anim_samples = {}
         with animation_lock:
@@ -1943,28 +2405,69 @@ def servo_worker():
             else:
                 arm_current_smoothed[arm_track] = tgt
 
-        pan_error = (pan_target_blended + jerk_offset + pan_avert + subtle_pan) - pan_current
-        tilt_error = (
-            tilt_target_blended + tilt_avert + conv_tilt + subtle_tilt + sad_nod_tilt + wake_tilt + sleep_tilt
-        ) - tilt_current
+        pan_goal = clamp(
+            pan_target_blended + jerk_offset + pan_avert + subtle_pan,
+            PAN_MIN,
+            PAN_MAX,
+        )
+        tilt_goal = clamp(
+            tilt_target_blended
+            + tilt_avert
+            + conv_tilt
+            + subtle_tilt
+            + sad_nod_tilt
+            + wake_tilt
+            + sleep_tilt,
+            TILT_MIN,
+            TILT_MAX,
+        )
 
-        if abs(pan_error) < SERVO_DEADZONE_DEG:
-            pan_error = 0.0
-        talk_bypass_deadzone = speaking and (face_locked or no_face_mode == "chat_ready")
-        if abs(tilt_error) < SERVO_DEADZONE_DEG and not talk_bypass_deadzone:
-            tilt_error = 0.0
-        elif talk_bypass_deadzone and abs(subtle_tilt) > 0.01:
-            min_tilt_step = math.copysign(min(abs(tilt_error), 0.35), tilt_error)
-            if abs(tilt_error) < SERVO_DEADZONE_DEG:
-                tilt_error = min_tilt_step
+        pan_motion = PAN_MOTION
+        if no_face_mode == "wandering" and not face_locked:
+            pan_motion = scale_head_motion(PAN_MOTION, wander_pan_speed_scale)
 
-        pan_step = clamp(pan_error * SMOOTHING, -MAX_SERVO_STEP_DEG, MAX_SERVO_STEP_DEG)
-        tilt_step = clamp(tilt_error * SMOOTHING, -MAX_SERVO_STEP_DEG, MAX_SERVO_STEP_DEG)
+        pan_current, servo_pan_vel = tick_toward(
+            pan_current,
+            servo_pan_vel,
+            pan_goal,
+            SERVO_LOOP_DELAY,
+            lo=PAN_MIN,
+            hi=PAN_MAX,
+            params=pan_motion,
+        )
+        tilt_current, servo_tilt_vel = tick_toward(
+            tilt_current,
+            servo_tilt_vel,
+            tilt_goal,
+            SERVO_LOOP_DELAY,
+            lo=TILT_MIN,
+            hi=TILT_MAX,
+            params=TILT_MOTION,
+        )
 
-        pan_current = clamp(pan_current + pan_step, PAN_MIN, PAN_MAX)
-        tilt_current = clamp(tilt_current + tilt_step, TILT_MIN, TILT_MAX)
+        _maybe_search_base_fov_nudge(
+            pan_current,
+            face_locked=face_locked,
+            mode=no_face_mode,
+        )
+        _maybe_wander_base_follow_nudge(
+            pan_current,
+            face_locked=face_locked,
+            mode=no_face_mode,
+        )
 
-        send_frame = animating or (now - _last_servo_frame_ts) >= SERVO_FRAME_INTERVAL
+        global _last_sent_pan, _last_sent_tilt
+        head_moved = (
+            _last_sent_pan is None
+            or _last_sent_tilt is None
+            or abs(pan_current - _last_sent_pan) >= HEAD_SEND_MIN_DELTA_DEG
+            or abs(tilt_current - _last_sent_tilt) >= HEAD_SEND_MIN_DELTA_DEG
+        )
+        send_frame = (
+            animating
+            or head_moved
+            or (now - _last_servo_frame_ts) >= SERVO_FRAME_INTERVAL
+        )
         if send_frame:
             try:
                 frame_tokens: dict[str, float] = {"P": pan_current, "T": tilt_current}
@@ -1985,6 +2488,8 @@ def servo_worker():
                 else:
                     servo_driver.write_angles(pan_current, tilt_current)
                 _last_servo_frame_ts = now
+                _last_sent_pan = pan_current
+                _last_sent_tilt = tilt_current
             except Exception as e:
                 print(f"Servo write error: {e}")
 
@@ -2065,12 +2570,14 @@ def get_runtime_state() -> dict:
     with target_lock:
         face = {
             "present": target_face_present,
+            "body_present": target_body_present,
             "count": target_face_count,
             "area_ratio": round(target_face_area_ratio, 4),
             "x_offset": round(smoothed_x_off, 2),
             "y_offset": round(smoothed_y_off, 2),
             "rotation": round(smoothed_rotation, 2),
             "tracking_active": face_tracking_active,
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
         }
 
     with servo_state_lock:
@@ -2080,6 +2587,7 @@ def get_runtime_state() -> dict:
             "tilt": round(servo_current_tilt, 2),
             "target_pan": round(servo_target_pan, 2),
             "target_tilt": round(servo_target_tilt, 2),
+            "tilt_from_eye_level_deg": round(search_tilt_from_eye_level_deg, 2),
         }
     with animation_lock:
         active_clip = animation_player.active_clip_id()
@@ -2182,21 +2690,22 @@ def map_coords_to_stream_preview(fx, fy, fw, fh, re_x, re_y, le_x, le_y):
 
 
 def vision_worker():
-    global ever_had_face, wander_search_phase, wander_search_last_ts, no_face_mode
+    global ever_had_face, organic_wander_search, no_face_mode
     global running, target_x_off, target_y_off, target_rotation, target_squint
-    global target_face_present, target_face_area_ratio, target_face_count
+    global target_face_present, target_body_present, target_face_area_ratio, target_face_count
     global squint_until, latest_frame, servo_target_pan, servo_target_tilt, last_face_seen_ts, next_talk_saccade_ts
     global last_face_pan, last_face_tilt, last_face_norm_x, last_face_norm_y, no_face_mode
     global wander_search_phase
     global amplitude_fast, amplitude_slow, amplitude_prev_fast
     global udp_conv_state, udp_conv_emotion, udp_speak_pulse
+    global _last_body_det, _last_body_det_ts, vision_frame_idx
 
     interval = 1.0 / max(1.0, float(VISION_FPS))
     next_tick = time.perf_counter()
 
     while running:
         try:
-            # Capture full frame and resize once for detector input
+            vision_frame_idx += 1
             large_frame = picam2.capture_array()
             frame_raw = cv2.resize(large_frame, CAMERA_RES)
             frame = frame_raw
@@ -2208,13 +2717,13 @@ def vision_worker():
             local_rot = 0.0
             local_squint = 0.0
             has_face = False
+            has_body = False
             face_area_ratio = 0.0
             face_count = 0
 
             if frame is not None and frame.size > 0:
                 stream_frame = None
                 if STREAM_ENABLED:
-                    # Preview uses natural camera orientation; detection uses rotated frame.
                     stream_source = frame_raw if CAMERA_ROTATE_180 else frame
                     stream_frame = cv2.resize(stream_source, STREAM_RES)
                     if STREAM_SWAP_RB:
@@ -2243,29 +2752,12 @@ def vision_worker():
 
                     face_cx = (fx + fw / 2) / CAMERA_RES[0]
                     face_cy = (fy + fh / 2) / CAMERA_RES[1]
-                    norm_x = -((face_cx - 0.5) * 2.0)
-                    # Invert Y: face lower in frame -> look down (was reversed on hardware).
-                    norm_y = -((face_cy - 0.5) * 2.0)
-                    norm_x = apply_deadzone_norm(norm_x, FACE_TRACK_DEADZONE_X)
-                    norm_y = apply_deadzone_norm(norm_y, FACE_TRACK_DEADZONE_Y)
 
-                    local_x = max(-MAX_X_OFFSET, min(MAX_X_OFFSET, norm_x * MAX_X_OFFSET))
-                    local_y = max(-MAX_Y_OFFSET, min(MAX_Y_OFFSET, norm_y * MAX_Y_OFFSET))
-
-                    if ENABLE_SERVO and servo_driver is not None:
-                        pan_center = (PAN_MIN + PAN_MAX) * 0.5
-                        tilt_center = (TILT_MIN + TILT_MAX) * 0.5
-                        mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
-                        mapped_tilt = clamp(tilt_center + (norm_y * TILT_TRACK_RANGE), TILT_MIN, TILT_MAX)
-                        with servo_state_lock:
-                            # Full-speed follow while face is visible (no speech damp on pan).
-                            current_alpha = FACE_TRACK_SERVO_ALPHA
-                            servo_target_pan = servo_target_pan + (mapped_pan - servo_target_pan) * current_alpha
-                            servo_target_tilt = servo_target_tilt + (mapped_tilt - servo_target_tilt) * current_alpha
-                            last_face_pan = mapped_pan
-                            last_face_tilt = mapped_tilt
-                            last_face_norm_x = norm_x
-                            last_face_norm_y = norm_y
+                    local_x, local_y, norm_x, norm_y, _, _ = _apply_detection_aim_point(
+                        fx + fw / 2,
+                        fy + fh / 2,
+                        servo_alpha=FACE_TRACK_SERVO_ALPHA,
+                    )
 
                     # Distance-based emotion: squint when far, excited when close
                     face_area_ratio = (fw * fh) / float(CAMERA_RES[0] * CAMERA_RES[1])
@@ -2288,13 +2780,76 @@ def vision_worker():
                         local_rot = max(-FACE_ROLL_MAX_DEG, min(FACE_ROLL_MAX_DEG, -angle_deg * FACE_ROLL_MULT))
                 else:
                     squint_until = 0.0
+                    if (
+                        BODY_ENABLED
+                        and person_detector is not None
+                        and vision_frame_idx % max(1, BODY_DETECT_STRIDE) == 0
+                    ):
+                        body_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        _last_body_det = person_detector.detect_largest(body_bgr)
+                        _last_body_det_ts = time.time()
+
+                    body_det = (
+                        _last_body_det
+                        if _last_body_det is not None
+                        and (time.time() - _last_body_det_ts) < 0.75
+                        else None
+                    )
+                    if body_det is not None:
+                        has_body = True
+                        bx, by, bw, bh = (
+                            body_det.x,
+                            body_det.y,
+                            body_det.w,
+                            body_det.h,
+                        )
+                        aim_cx = body_det.cx
+                        aim_cy = body_det.aim_y(BODY_AIM_Y_RATIO)
+
+                        if STREAM_ENABLED and stream_frame is not None:
+                            bx_s, by_s, bw_s, bh_s, _, _, _, _ = map_coords_to_stream_preview(
+                                int(bx),
+                                int(by),
+                                int(bw),
+                                int(bh),
+                                0,
+                                0,
+                                0,
+                                0,
+                            )
+                            cv2.rectangle(
+                                stream_frame,
+                                (bx_s, by_s),
+                                (bx_s + bw_s, by_s + bh_s),
+                                (255, 140, 0),
+                                2,
+                            )
+                            ax_s = int((aim_cx / CAMERA_RES[0]) * STREAM_RES[0])
+                            ay_s = int((aim_cy / CAMERA_RES[1]) * STREAM_RES[1])
+                            if CAMERA_ROTATE_180:
+                                ax_s = STREAM_RES[0] - ax_s
+                                ay_s = STREAM_RES[1] - ay_s
+                            cv2.circle(stream_frame, (ax_s, ay_s), 4, (255, 140, 0), -1)
+
+                        local_x, local_y, _, _, _, _ = _apply_detection_aim_point(
+                            aim_cx,
+                            aim_cy,
+                            servo_alpha=BODY_TRACK_SERVO_ALPHA,
+                        )
+                        face_area_ratio = (bw * bh) / float(
+                            CAMERA_RES[0] * CAMERA_RES[1]
+                        )
 
                 now_vis = time.time()
-                if has_face:
+                if has_face or has_body:
                     last_face_seen_ts = now_vis
-                    global ever_had_face
-                    ever_had_face = True
-                face_locked = has_face or (now_vis - last_face_seen_ts) < FACE_PRESENT_HOLD_SEC
+                    if has_face:
+                        global ever_had_face
+                        ever_had_face = True
+                presence_locked = has_face or has_body or (
+                    now_vis - last_face_seen_ts
+                ) < FACE_PRESENT_HOLD_SEC
+                face_locked = presence_locked
 
                 if not face_locked:
                     if no_face_mode == "wandering":
@@ -2317,38 +2872,55 @@ def vision_worker():
                     pan_idle = clamp(
                         pan_center + NO_FACE_IDLE_PAN_DEG, PAN_MIN, PAN_MAX
                     )
-                    tilt_idle = clamp(
-                        tilt_center + NO_FACE_IDLE_TILT_DEG, TILT_MIN, TILT_MAX
-                    )
+                    tilt_idle = _tilt_down_from_center(NO_FACE_IDLE_TILT_DEG)
                     with servo_state_lock:
                         if no_face_mode == "wandering":
-                            global wander_search_phase, wander_search_last_ts
-                            dt = min(0.12, max(0.0, now_vis - wander_search_last_ts))
-                            wander_search_last_ts = now_vis
-                            wander_search_phase += (
-                                dt * (2.0 * math.pi / max(1.0, WANDER_SEARCH_PERIOD_SEC))
+                            global organic_wander_search, search_tilt_from_eye_level_deg
+                            global wander_pan_speed_scale
+                            pan_current = servo_current_pan
+                            wpan, wtilt = organic_wander_search.tick(
+                                now_vis,
+                                pan_center=pan_center,
+                                tilt_center=tilt_center,
+                                pan_current=pan_current,
+                                pan_min=PAN_MIN,
+                                pan_max=PAN_MAX,
+                                tilt_min=TILT_MIN,
+                                tilt_max=TILT_MAX,
+                                amp_deg=WANDER_SEARCH_PAN_AMP_DEG,
+                                step_min_deg=WANDER_SEARCH_PAN_STEP_MIN_DEG,
+                                step_max_deg=WANDER_SEARCH_PAN_STEP_MAX_DEG,
+                                hold_min_sec=WANDER_SEARCH_HOLD_MIN_SEC,
+                                hold_max_sec=WANDER_SEARCH_HOLD_MAX_SEC,
+                                jump_chance=WANDER_SEARCH_JUMP_CHANCE,
+                                arrival_deg=WANDER_SEARCH_ARRIVAL_DEG,
+                                tilt_max_up_deg=WANDER_SEARCH_TILT_MAX_UP_DEG,
+                                tilt_max_down_deg=WANDER_SEARCH_TILT_MAX_DOWN_DEG,
+                                thinking_hold_chance=WANDER_SEARCH_THINKING_HOLD_CHANCE,
+                                thinking_hold_min_sec=WANDER_SEARCH_THINKING_HOLD_MIN_SEC,
+                                thinking_hold_max_sec=WANDER_SEARCH_THINKING_HOLD_MAX_SEC,
+                                long_stare_chance=WANDER_SEARCH_LONG_STARE_CHANCE,
                             )
-                            if ever_had_face:
-                                pan_anchor = last_face_pan
-                                tilt_anchor = last_face_tilt
-                            else:
-                                pan_anchor = pan_center
-                                tilt_anchor = tilt_center
-                            servo_target_pan = clamp(
-                                pan_anchor
-                                + math.sin(wander_search_phase) * WANDER_SEARCH_PAN_AMP_DEG,
-                                PAN_MIN,
-                                PAN_MAX,
+                            search_tilt_from_eye_level_deg = wander_search_tilt_from_eye_level(
+                                servo_target_tilt, tilt_center
                             )
-                            servo_target_tilt = clamp(
-                                tilt_anchor
-                                + math.cos(
-                                    wander_search_phase * WANDER_SEARCH_TILT_PHASE_K
-                                )
-                                * WANDER_SEARCH_TILT_AMP_DEG,
-                                TILT_MIN,
-                                TILT_MAX,
+                            wander_pan_speed_scale = organic_wander_search.move_speed_scale
+                            speed = wander_pan_speed_scale
+                            hold_scale = 0.45
+                            if not organic_wander_search.moving:
+                                if organic_wander_search.pause_kind == "thinking":
+                                    hold_scale = 0.28
+                                elif organic_wander_search.pause_kind == "long_stare":
+                                    hold_scale = 0.32
+                                elif organic_wander_search.pause_kind == "glance":
+                                    hold_scale = 0.52
+                            pan_alpha = WANDER_PAN_TARGET_ALPHA * speed * (
+                                1.35 if organic_wander_search.moving else hold_scale
                             )
+                            servo_target_pan += (wpan - servo_target_pan) * pan_alpha
+                            servo_target_tilt += (
+                                wtilt - servo_target_tilt
+                            ) * WANDER_TILT_TARGET_ALPHA
                         elif no_face_mode == "sad_return":
                             servo_target_pan = servo_target_pan + (
                                 pan_idle - servo_target_pan
@@ -2377,7 +2949,8 @@ def vision_worker():
                     target_y_off = local_y
                     target_rotation = local_rot
                     target_squint = local_squint
-                    target_face_present = face_locked
+                    target_face_present = presence_locked
+                    target_body_present = has_body and not has_face
                     target_face_area_ratio = face_area_ratio
                     target_face_count = face_count
 
@@ -2395,27 +2968,68 @@ def vision_worker():
         else:
             next_tick = time.perf_counter()
 
+
+def _start_servo_hardware(driver) -> None:
+    """Center head, start servo worker (+ ToF when enabled)."""
+    global servo_driver, servo_running, servo_thread
+
+    if driver is None or servo_running:
+        return
+    servo_driver = driver
+    pan_c, tilt_c = head_center_angles()
+    try:
+        servo_driver.write_angles(pan_c, tilt_c, force=True)
+    except TypeError:
+        servo_driver.write_angles(pan_c, tilt_c)
+    print(
+        f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
+        f"— face tracking enabled"
+    )
+    servo_running = True
+    servo_thread = threading.Thread(target=servo_worker, daemon=True)
+    servo_thread.start()
+    if TOF_ENABLED:
+        threading.Thread(target=tof_worker, daemon=True).start()
+        print(f"ToF presence polling at {TOF_POLL_HZ:.1f} Hz (ESP32 F command)")
+
+
+def _servo_connect_worker() -> None:
+    """Background ESP32 connect when early boot or camera load delays READY."""
+    global running
+    delay_sec = 5.0
+    while running and not servo_running:
+        driver = create_servo_driver(cfg, max_attempts=2, retry_delay_sec=2.0)
+        if driver is not None:
+            _start_servo_hardware(driver)
+            return
+        time.sleep(delay_sec)
+
+
 print("Starting Tracking Loop...")
 time.sleep(1.0) # Warmup
 
 _load_default_animation_clips()
 
 if ENABLE_SERVO:
-    check_servo_channel_config(cfg.servo.pan_ch, cfg.servo.tilt_ch, backend=cfg.servo.backend)
-    servo_driver = create_servo_driver(cfg)
-    if servo_driver is not None:
-        pan_c, tilt_c = head_center_angles()
-        servo_driver.write_angles(pan_c, tilt_c, force=True)
-        print(f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} — face tracking enabled")
-        servo_running = True
-        servo_thread = threading.Thread(target=servo_worker, daemon=True)
-        servo_thread.start()
-    else:
-        print("Head servo driver unavailable; running eyes-only mode.")
+    if _boot_servo_driver is not None:
+        _start_servo_hardware(_boot_servo_driver)
+    elif not servo_running:
+        print(
+            "Head servo driver unavailable at startup; "
+            "retrying ESP32 connect in background..."
+        )
+        threading.Thread(target=_servo_connect_worker, daemon=True).start()
 
-if TOF_ENABLED and servo_driver is not None:
-    threading.Thread(target=tof_worker, daemon=True).start()
-    print(f"ToF presence polling at {TOF_POLL_HZ:.1f} Hz (ESP32 F command)")
+
+def _handle_shutdown_signal(signum, frame):
+    global running, servo_running
+    running = False
+    servo_running = False
+    raise KeyboardInterrupt
+
+
+signal.signal(signal.SIGINT, _handle_shutdown_signal)
+signal.signal(signal.SIGTERM, _handle_shutdown_signal)
 
 if STREAM_ENABLED:
     try:
@@ -2535,6 +3149,10 @@ try:
             next_wander_peek_ts = 0.0
             wander_search_phase = 0.0
             wander_search_last_ts = now
+            organic_wander_search.reset(
+                (PAN_MIN + PAN_MAX) * 0.5, (TILT_MIN + TILT_MAX) * 0.5, now
+            )
+            search_tilt_from_eye_level_deg = 0.0
             chat_ready_until = 0.0
             wake_tilt_jerk_until = 0.0
             clear_gaze_aversion()
@@ -2572,6 +3190,10 @@ try:
             sad_return_start = 0.0
             wander_search_phase = random.uniform(0.0, math.tau)
             wander_search_last_ts = now
+            organic_wander_search.reset(
+                (PAN_MIN + PAN_MAX) * 0.5, (TILT_MIN + TILT_MAX) * 0.5, now
+            )
+            search_tilt_from_eye_level_deg = 0.0
             next_wander_peek_ts = now + random.uniform(
                 WANDER_PEEK_MIN_SEC, WANDER_PEEK_MAX_SEC
             )
@@ -2611,22 +3233,49 @@ try:
         multi_face_entered = multi_face_stable and not router_multi_face_prev
 
         # Side-look hysteresis and direction cooldown reduce left/right chatter.
-        abs_x = abs(smoothed_x_off)
-        next_side_dir = side_dir_state
-        if side_dir_state == 0:
-            if abs_x >= SIDE_LOOK_ENTER_OFFSET:
-                next_side_dir = 1 if smoothed_x_off >= 0 else -1
-        else:
-            if abs_x <= SIDE_LOOK_EXIT_OFFSET:
-                next_side_dir = 0
+        pan_center = (PAN_MIN + PAN_MAX) * 0.5
+        with servo_state_lock:
+            render_pan_cur = servo_current_pan
+        head_pan_deg_render = render_pan_cur - pan_center
+        head_eye_preview_x = (
+            head_pan_deg_render
+            * HEAD_PAN_PX_PER_DEG
+            * EYE_HEAD_RATIO_WANDER
+            * HEAD_EYE_PAN_SIGN
+        )
+        if no_face_mode == "wandering" and not gaze_event_active:
+            side_look_source_x = head_eye_preview_x
+            next_side_dir = side_dir_state
+            if side_dir_state == 0:
+                if head_pan_deg_render >= WANDER_SIDE_LOOK_PAN_DEG:
+                    next_side_dir = 1
+                elif head_pan_deg_render <= -WANDER_SIDE_LOOK_PAN_DEG:
+                    next_side_dir = -1
             else:
-                candidate_dir = 1 if smoothed_x_off >= 0 else -1
-                if (
-                    candidate_dir != side_dir_state
-                    and abs_x >= SIDE_LOOK_ENTER_OFFSET
-                    and (now - side_dir_last_switch_ts) >= SIDE_LOOK_SWITCH_COOLDOWN_SEC
-                ):
-                    next_side_dir = candidate_dir
+                if abs(head_pan_deg_render) <= WANDER_SIDE_LOOK_PAN_DEG * 0.45:
+                    next_side_dir = 0
+                elif head_pan_deg_render >= WANDER_SIDE_LOOK_PAN_DEG:
+                    next_side_dir = 1
+                elif head_pan_deg_render <= -WANDER_SIDE_LOOK_PAN_DEG:
+                    next_side_dir = -1
+        else:
+            side_look_source_x = smoothed_x_off
+            abs_x = abs(side_look_source_x)
+            next_side_dir = side_dir_state
+            if side_dir_state == 0:
+                if abs_x >= SIDE_LOOK_ENTER_OFFSET:
+                    next_side_dir = 1 if side_look_source_x >= 0 else -1
+            else:
+                if abs_x <= SIDE_LOOK_EXIT_OFFSET:
+                    next_side_dir = 0
+                else:
+                    candidate_dir = 1 if side_look_source_x >= 0 else -1
+                    if (
+                        candidate_dir != side_dir_state
+                        and abs_x >= SIDE_LOOK_ENTER_OFFSET
+                        and (now - side_dir_last_switch_ts) >= SIDE_LOOK_SWITCH_COOLDOWN_SEC
+                    ):
+                        next_side_dir = candidate_dir
         if next_side_dir != side_dir_state:
             side_dir_state = next_side_dir
             side_dir_last_switch_ts = now
@@ -2694,11 +3343,11 @@ try:
                     ])
                 else:
                     social_mode = weighted_pick([
-                        ("uncertain", 0.30),
-                        ("curious_intense", 0.25),
-                        ("thinking", 0.20),
-                        ("attentive", 0.15),
-                        ("warm", 0.10),
+                        ("thinking", 0.28),
+                        ("concentrating", 0.22),
+                        ("uncertain", 0.22),
+                        ("curious_intense", 0.15),
+                        ("attentive", 0.13),
                     ])
             elif upbeat:
                 social_mode = pick_upbeat_solo_emotion()
@@ -2750,6 +3399,17 @@ try:
             elif no_face_mode == "wandering":
                 if gaze_event_active and gaze_state == "AVERT_SCAN" and scan_emotion_override:
                     target_emotion_raw = scan_emotion_override
+                elif abs(head_pan_deg_render) >= WANDER_SIDE_LOOK_PAN_DEG:
+                    target_emotion_raw = (
+                        "looking_right_natural"
+                        if head_pan_deg_render > 0
+                        else "looking_left_natural"
+                    )
+                elif (
+                    not organic_wander_search.moving
+                    and organic_wander_search.hold_emotion_hint in WANDER_EMOTIONS
+                ):
+                    target_emotion_raw = organic_wander_search.hold_emotion_hint
                 elif social_mode in WANDER_EMOTIONS:
                     target_emotion_raw = social_mode
                 else:
@@ -2999,6 +3659,10 @@ try:
                 )
                 wander_search_phase = random.uniform(0.0, math.pi * 2.0)
                 wander_search_last_ts = now
+                organic_wander_search.reset(
+                    (PAN_MIN + PAN_MAX) * 0.5, (TILT_MIN + TILT_MAX) * 0.5, now
+                )
+                search_tilt_from_eye_level_deg = 0.0
             if no_face_mode == "wandering":
                 if now >= wander_until:
                     no_face_mode = "sad_return"
@@ -3063,15 +3727,23 @@ try:
             tilt_cur = servo_current_tilt
         head_pan_deg = pan_cur - pan_center
         head_tilt_deg = tilt_cur - tilt_center
-        head_ratio = EYE_HEAD_RATIO_FACE if local_face_present else EYE_HEAD_RATIO
+        if no_face_mode == "wandering" and not gaze_event_active:
+            head_ratio = EYE_HEAD_RATIO_WANDER
+            head_smooth_alpha = min(0.38, EYE_HEAD_SMOOTH_ALPHA * 2.4)
+        elif local_face_present:
+            head_ratio = EYE_HEAD_RATIO_FACE
+            head_smooth_alpha = EYE_HEAD_SMOOTH_ALPHA
+        else:
+            head_ratio = EYE_HEAD_RATIO
+            head_smooth_alpha = EYE_HEAD_SMOOTH_ALPHA
         raw_head_eye_x = (
             head_pan_deg * HEAD_PAN_PX_PER_DEG * head_ratio * HEAD_EYE_PAN_SIGN
         )
         raw_head_eye_y = (
             head_tilt_deg * HEAD_TILT_PX_PER_DEG * head_ratio * HEAD_EYE_TILT_SIGN
         )
-        smoothed_head_eye_x += (raw_head_eye_x - smoothed_head_eye_x) * EYE_HEAD_SMOOTH_ALPHA
-        smoothed_head_eye_y += (raw_head_eye_y - smoothed_head_eye_y) * EYE_HEAD_SMOOTH_ALPHA
+        smoothed_head_eye_x += (raw_head_eye_x - smoothed_head_eye_x) * head_smooth_alpha
+        smoothed_head_eye_y += (raw_head_eye_y - smoothed_head_eye_y) * head_smooth_alpha
 
         # Gaze peeks already layer eye + servo offsets; skip head coupling to avoid doubling.
         if gaze_event_active:
@@ -3223,20 +3895,14 @@ except KeyboardInterrupt:
     print("\nStopping...")
 finally:
     running = False
+    servo_running = False
     if vision_thread.is_alive():
         vision_thread.join(timeout=1.0)
 
     if servo_thread and servo_thread.is_alive():
-        servo_running = False
-        servo_thread.join(timeout=1.0)
+        servo_thread.join(timeout=0.5)
 
-    if servo_driver is not None:
-        try:
-            pan_home, tilt_home = head_center_angles()
-            servo_driver.close(home_pan=pan_home, home_tilt=tilt_home)
-            print("Servos homed and serial closed.")
-        except Exception as e:
-            print(e)
+    _home_servos_on_shutdown()
 
     # Cleanup attributes
     try:

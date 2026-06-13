@@ -59,13 +59,25 @@ class DisplayConfig:
 @dataclass
 class CameraConfig:
     face_model_path: str = "face_detection_yunet_2023mar.onnx"
+    body_model_path: str = "yolov8n.onnx"
+    body_enabled: bool = True
+    body_confidence_threshold: float = 0.35
+    body_nms_threshold: float = 0.45
+    body_input_size: int = 640
+    body_detect_stride: int = 2
+    body_track_servo_alpha: float = 0.30
+    body_aim_y_ratio: float = 0.22
     main_res: list[int] = field(default_factory=lambda: [1280, 720])
-    detect_res: list[int] = field(default_factory=lambda: [640, 360])
+    detect_res: list[int] = field(default_factory=lambda: [960, 540])
     stream_res: list[int] = field(default_factory=lambda: [320, 180])
-    confidence_threshold: float = 0.6
+    confidence_threshold: float = 0.32
     nms_threshold: float = 0.3
     rotate_180: bool = True
     stream_swap_rb: bool = True
+    awb_mode: str = "auto"
+    colour_gains: list[float] | None = None
+    stream_white_balance: bool = True
+    stream_wb_strength: float = 0.85
 
 
 @dataclass
@@ -100,6 +112,7 @@ class EyesConfig:
     look_side_offset: float = 16.0
     eye_head_ratio: float = 0.88
     eye_head_ratio_face: float = 0.38
+    eye_head_ratio_wander: float = 0.95
     eye_head_smooth_alpha: float = 0.14
     head_eye_pan_sign: float = 1.0
     head_eye_tilt_sign: float = -1.0
@@ -134,9 +147,10 @@ class FaceTrackingConfig:
     face_track_deadzone_x: float = 0.06
     face_track_deadzone_y: float = 0.07
     face_track_servo_alpha: float = 0.38
-    face_present_hold_sec: float = 0.50
+    face_track_tilt_sign: float = -1.0
+    face_present_hold_sec: float = 0.75
     face_absent_before_scan_sec: float = 1.0
-    face_stable_before_track_sec: float = 0.6
+    face_stable_before_track_sec: float = 0.25
     face_acquire_snap_alpha: float = 0.55
     face_acquire_snap_duration_sec: float = 0.40
     face_scan_cooldown_after_lock_sec: float = 6.0
@@ -149,21 +163,54 @@ class FaceTrackingConfig:
     wander_peek_min_sec: float = 5.0
     wander_peek_max_sec: float = 8.0
     wander_peek_chance: float = 0.85
-    wander_search_pan_amp_deg: float = 18.0
-    wander_search_tilt_amp_deg: float = 12.0
-    wander_search_period_sec: float = 14.0
-    wander_search_tilt_phase_k: float = 1.3
+    wander_search_pan_amp_deg: float = 28.0
+    wander_search_pan_step_min_deg: float = 8.0
+    wander_search_pan_step_max_deg: float = 32.0
+    wander_search_hold_min_sec: float = 1.4
+    wander_search_hold_max_sec: float = 6.5
+    wander_search_thinking_hold_chance: float = 0.38
+    wander_search_thinking_hold_min_sec: float = 4.0
+    wander_search_thinking_hold_max_sec: float = 9.5
+    wander_search_long_stare_chance: float = 0.14
+    wander_search_jump_chance: float = 0.38
+    wander_search_arrival_deg: float = 2.0
+    wander_search_tilt_max_up_deg: float = 1.8
+    wander_search_tilt_max_down_deg: float = 3.5
+    wander_search_drift_min_vel: float = 4.0
+    wander_search_drift_max_vel: float = 11.0
+    wander_search_perturb_min_sec: float = 2.5
+    wander_search_perturb_max_sec: float = 7.0
+    wander_search_flip_chance: float = 0.32
+    wander_search_edge_slow_deg: float = 12.0
+    wander_search_tilt_recenter_alpha: float = 0.14
+    wander_side_look_pan_deg: float = 3.5
+    wander_search_tilt_amp_deg: float = 1.5
+    wander_search_period_sec: float = 22.0
+    wander_search_tilt_phase_k: float = 0.35
+    wander_search_ease_power: float = 2.0
+    wander_tilt_target_alpha: float = 0.045
+    wander_pan_target_alpha: float = 0.11
+    search_base_edge_deg: float = 6.0
+    search_base_nudge_deg: float = 2.0
+    search_base_cooldown_sec: float = 3.0
+    wander_base_follow_chance: float = 0.18
+    wander_base_follow_deg: float = 0.9
+    wander_base_follow_min_pan_deg: float = 6.0
+    wander_base_follow_min_drift_vel: float = 2.5
+    wander_base_follow_cooldown_sec: float = 10.0
+    wander_base_follow_eval_sec: float = 2.2
     sad_return_sec: float = 10.0
     sad_nod_tilt_deg: float = 10.0
     sad_nod_count: float = 2.0
     no_face_sad_recenter_alpha: float = 0.12
     wander_emotions: list[str] = field(default_factory=lambda: [
-        "curious_intense", "uncertain", "thinking", "attentive", "curious",
+        "thinking", "concentrating", "uncertain", "curious_intense",
+        "attentive", "curious", "remembering",
     ])
     settled_sleepy_variety_min_sec: float = 20.0
     settled_sleepy_variety_max_sec: float = 40.0
     no_face_idle_pan_deg: float = 14.0
-    no_face_idle_tilt_deg: float = 10.0
+    no_face_idle_tilt_deg: float = 12.0
     no_face_idle_eye_x: float = 8.0
     no_face_idle_eye_y: float = 10.0
     chat_ready_recenter_alpha: float = 0.18
@@ -214,8 +261,8 @@ class GazeConfig:
     no_face_scan_trigger_chance: float = 0.55
     no_face_scan_retry_min_sec: float = 3.0
     no_face_scan_retry_max_sec: float = 7.0
-    no_face_scan_servo_pan_deg: float = 12.0
-    no_face_scan_servo_tilt_deg: float = 10.0
+    no_face_scan_servo_pan_deg: float = 8.0
+    no_face_scan_servo_tilt_deg: float = 3.0
     no_face_scan_tilt_phase: float = 0.35
     solo_upbeat_min_sec: float = 25.0
     social_release_min_sec: float = 20.0
@@ -241,15 +288,29 @@ class ServoConfig:
     pan_ch: int = 4
     tilt_ch: int = 5
     pan_min: float = 40.0
-    pan_max: float = 130.0
-    tilt_min: float = 80.0
-    tilt_max: float = 130.0
+    pan_max: float = 120.0
+    tilt_min: float = 100.0
+    tilt_max: float = 120.0
     pulse_min: int = 450
     pulse_max: int = 2600
     smoothing: float = 0.10
     loop_delay: float = 0.01
     max_step_deg: float = 1.4
     deadzone_deg: float = 0.22
+    pan_max_vel: float = 22.0
+    pan_accel: float = 55.0
+    pan_decel: float = 85.0
+    pan_track_gain: float = 1.6
+    tilt_max_vel_up: float = 18.0
+    tilt_max_vel_down: float = 10.0
+    tilt_accel: float = 45.0
+    tilt_decel: float = 70.0
+    tilt_decel_down_mult: float = 1.85
+    head_vel_blend: float = 0.28
+    tilt_head_vel_blend: float = 0.12
+    tilt_track_gain: float = 2.4
+    goal_deadband_deg: float = 0.03
+    head_send_min_delta_deg: float = 0.025
     pan_track_range: float = 26.0
     tilt_track_range: float = 24.0
     target_filter_alpha: float = 0.30
@@ -274,6 +335,7 @@ class BaseConfig:
     enabled: bool = True
     counts_per_degree: float = 1.0
     max_relative_deg: float = 180.0
+    max_deg_from_zero: float = 20.0
     move_timeout_sec: float = 15.0
 
 
