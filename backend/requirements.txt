@@ -36,3 +36,4 @@ vaderSentiment
 python-dotenv==1.2.1
 duckduckgo-search
 pyyaml
+openai>=1.0.0

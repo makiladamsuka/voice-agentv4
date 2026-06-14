@@ -151,6 +151,48 @@
     #action-msg { margin-top: 8px; font-size: 11px; color: var(--muted); }
     #action-msg.error { color: #ff6b6b; }
     #action-msg.ok { color: var(--ok); }
+    .tof-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 1.4fr) minmax(220px, 1fr);
+      gap: 12px;
+      align-items: start;
+    }
+    @media (max-width: 900px) { .tof-grid { grid-template-columns: 1fr; } }
+    #tof-radar {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: radial-gradient(circle at 50% 88%, #0f1620 0%, #0a0e14 70%);
+      border-radius: 6px;
+    }
+    .tof-readings {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+    }
+    @media (max-width: 560px) { .tof-readings { grid-template-columns: 1fr; } }
+    .tof-card {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px;
+      border-top: 3px solid #4a5568;
+    }
+    .tof-card.valid.left { border-top-color: #3dd68c; }
+    .tof-card.valid.center { border-top-color: #58a6ff; }
+    .tof-card.valid.right { border-top-color: #f5a623; }
+    .tof-card .label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .tof-card .mm {
+      font-size: 18px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      margin-top: 4px;
+    }
+    .tof-card .mm.invalid { color: var(--muted); font-size: 14px; }
   </style>
 </head>
 <body>
@@ -185,6 +227,34 @@
     <section class="panel">
       <h2>Servo</h2>
       <div class="panel-body" id="servo-panel">—</div>
+    </section>
+
+    <section class="panel panel-wide">
+      <h2>ToF Sensors</h2>
+      <div class="panel-body">
+        <div class="tof-grid">
+          <canvas id="tof-radar" width="640" height="420"></canvas>
+          <div>
+            <div class="tof-readings" id="tof-readings">
+              <div class="tof-card left" id="tof-card-left">
+                <div class="label">Left</div>
+                <div class="mm invalid" id="tof-mm-left">—</div>
+              </div>
+              <div class="tof-card center" id="tof-card-center">
+                <div class="label">Center</div>
+                <div class="mm invalid" id="tof-mm-center">—</div>
+              </div>
+              <div class="tof-card right" id="tof-card-right">
+                <div class="label">Right</div>
+                <div class="mm invalid" id="tof-mm-right">—</div>
+              </div>
+            </div>
+            <dl style="margin-top:10px" id="tof-meta-panel">
+              <dt>Approach</dt><dd>—</dd>
+            </dl>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section class="panel panel-wide">
@@ -235,8 +305,135 @@
   <script>
     const statusBar = document.getElementById("status-bar");
     const actionMsg = document.getElementById("action-msg");
+    const tofCanvas = document.getElementById("tof-radar");
+    const tofCtx = tofCanvas.getContext("2d");
+    const TOF_MAX_MM = 2000;
+    const TOF_CLEAR_BEAM_MM = 200;
+    const TOF_FOV_DEG = 25;
+    const TOF_AZIMUTH = { left: -45, center: 0, right: 45 };
     let tuningFields = [];
     let patchTimer = null;
+
+    function tofMmLabel(mm, valid) {
+      if (!valid || mm < 0) return "clear";
+      return `${mm} mm`;
+    }
+
+    function tofRadarData(tof) {
+      if (!tof) return null;
+      const snap = tof.snapshot || tof;
+      return {
+        left_mm: snap.left_mm ?? -1,
+        center_mm: snap.center_mm ?? -1,
+        right_mm: snap.right_mm ?? -1,
+        left_valid: !!snap.left_valid,
+        center_valid: !!snap.center_valid,
+        right_valid: !!snap.right_valid,
+      };
+    }
+
+    function updateTofCards(data) {
+      for (const key of ["left", "center", "right"]) {
+        const mm = data[`${key}_mm`];
+        const valid = data[`${key}_valid`];
+        const card = document.getElementById(`tof-card-${key}`);
+        const el = document.getElementById(`tof-mm-${key}`);
+        if (!card || !el) continue;
+        card.classList.toggle("valid", valid);
+        el.classList.toggle("invalid", !valid);
+        el.textContent = tofMmLabel(mm, valid);
+      }
+    }
+
+    function drawTofRadar(data) {
+      if (!data) return;
+      const w = tofCanvas.width;
+      const h = tofCanvas.height;
+      const cx = w / 2;
+      const cy = h - 40;
+      const scale = (h - 70) / TOF_MAX_MM;
+      tofCtx.clearRect(0, 0, w, h);
+
+      tofCtx.strokeStyle = "#1e2a3a";
+      tofCtx.lineWidth = 1;
+      for (const rMm of [200, 500, 1000, 1500, 2000]) {
+        const r = rMm * scale;
+        tofCtx.beginPath();
+        tofCtx.arc(cx, cy, r, Math.PI, 0, false);
+        tofCtx.stroke();
+        tofCtx.fillStyle = "#7d8da6";
+        tofCtx.font = "10px sans-serif";
+        tofCtx.fillText(`${rMm}`, cx + r + 3, cy - 2);
+      }
+
+      tofCtx.fillStyle = "#243044";
+      tofCtx.beginPath();
+      tofCtx.moveTo(cx, cy + 6);
+      tofCtx.lineTo(cx - 18, cy + 28);
+      tofCtx.lineTo(cx + 18, cy + 28);
+      tofCtx.closePath();
+      tofCtx.fill();
+
+      const colors = { left: "#3dd68c", center: "#58a6ff", right: "#f5a623" };
+      for (const key of ["left", "center", "right"]) {
+        const azDeg = TOF_AZIMUTH[key];
+        const az = (-90 + azDeg) * (Math.PI / 180);
+        const mm = data[`${key}_mm`];
+        const valid = data[`${key}_valid`];
+        const color = colors[key];
+        const halfFov = (TOF_FOV_DEG / 2) * (Math.PI / 180);
+        const wedgeR = TOF_MAX_MM * scale;
+        tofCtx.fillStyle = color + "18";
+        tofCtx.beginPath();
+        tofCtx.moveTo(cx, cy);
+        tofCtx.arc(cx, cy, wedgeR, az - halfFov, az + halfFov, false);
+        tofCtx.closePath();
+        tofCtx.fill();
+
+        const hasReading = valid && mm >= 0;
+        const dist = hasReading ? Math.min(mm, TOF_MAX_MM) : TOF_CLEAR_BEAM_MM;
+        const len = dist * scale;
+        const ex = cx + Math.cos(az) * len;
+        const ey = cy + Math.sin(az) * len;
+        tofCtx.strokeStyle = color;
+        tofCtx.lineWidth = valid ? 2.5 : 1.5;
+        tofCtx.setLineDash(valid ? [] : [6, 6]);
+        tofCtx.globalAlpha = valid ? 1 : 0.45;
+        tofCtx.beginPath();
+        tofCtx.moveTo(cx, cy);
+        tofCtx.lineTo(ex, ey);
+        tofCtx.stroke();
+        tofCtx.setLineDash([]);
+        tofCtx.globalAlpha = 1;
+        if (valid) {
+          tofCtx.fillStyle = color;
+          tofCtx.beginPath();
+          tofCtx.arc(ex, ey, 7, 0, Math.PI * 2);
+          tofCtx.fill();
+        }
+      }
+    }
+
+    function renderTofPanel(tof) {
+      const data = tofRadarData(tof);
+      if (!data) {
+        document.getElementById("tof-meta-panel").innerHTML =
+          "<dt>ToF</dt><dd>disabled</dd>";
+        return;
+      }
+      updateTofCards(data);
+      drawTofRadar(data);
+      const pres = tof.presence || {};
+      const offset = tof.target_pan_offset_deg ?? tof.bearing_deg;
+      document.getElementById("tof-meta-panel").innerHTML = `
+        <dt>Enabled</dt><dd>${badge(tof.enabled)}</dd>
+        <dt>Presence L/C/R</dt><dd>${badge(pres.left)} ${badge(pres.center)} ${badge(pres.right)}</dd>
+        <dt>Pan target</dt><dd>${offset == null ? "—" : offset + "°"}</dd>
+        <dt>Phase</dt><dd>${tof.approach_phase ?? "idle"}</dd>
+        <dt>Latched</dt><dd>${tof.latched_sector ?? "—"}</dd>
+        <dt>Approach active</dt><dd>${badge(tof.approach_active)}</dd>
+        <dt>Base turn</dt><dd>${badge(tof.use_base)}</dd>`;
+    }
 
     function showAction(msg, ok = true) {
       actionMsg.textContent = msg;
@@ -298,6 +495,8 @@
           <dt>Pan</dt><dd>${s.servo.pan}° (target ${s.servo.target_pan}°)</dd>
           <dt>Tilt</dt><dd>${s.servo.tilt}° (target ${s.servo.target_tilt}°)</dd>
         </dl>`;
+
+      renderTofPanel(s.tof);
     }
 
     function renderTuningSliders() {

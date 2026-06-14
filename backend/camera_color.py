@@ -16,6 +16,7 @@ import numpy as np
 from PIL import Image
 
 PICAMERA_MAIN_FORMAT = "RGB888"
+PICAMERA_PREVIEW_FORMAT = "XBGR8888"  # rpicam-hello / create_preview_configuration
 
 # Set at boot by probe_yunet_bgr_mode(); used every vision frame.
 DETECTION_BGR_MODE = "rgb_to_bgr"
@@ -54,10 +55,46 @@ def to_stream_rgb(
     display_swap_rb: bool = False,
 ) -> np.ndarray:
     """RGB for dashboard overlays. Preview uses unrotated resize (coords mapped separately)."""
-    rgb = capture
-    if display_swap_rb:
+    rgb = frame_to_rgb(capture, legacy_swap_rb=display_swap_rb)
+    return rgb
+
+
+def frame_to_rgb(frame: np.ndarray, *, legacy_swap_rb: bool = False) -> np.ndarray:
+    """Convert Picamera2 capture to display RGB (PIL/JPEG).
+
+    Picamera2 format → numpy layout (see picamera2 request._get_pil_mode):
+      XBGR8888 preview: [R, G, B, X]  — take :3, already RGB
+      RGB888 video:     [B, G, R]    — swap channels (or set legacy_swap_rb)
+    """
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        return np.ascontiguousarray(frame[:, :, :3])
+    rgb = np.ascontiguousarray(frame)
+    if legacy_swap_rb:
         rgb = rgb[:, :, ::-1]
     return rgb
+
+
+def configure_picamera(
+    picam2,
+    main_res: tuple[int, int],
+    *,
+    use_preview_pipeline: bool = True,
+    buffer_count: int = 2,
+) -> object:
+    """Configure Picamera2. Preview pipeline matches rpicam-hello (sRGB ISP)."""
+    size = (int(main_res[0]), int(main_res[1]))
+    if use_preview_pipeline:
+        config = picam2.create_preview_configuration(
+            main={"size": size},
+            buffer_count=buffer_count,
+        )
+    else:
+        config = picam2.create_video_configuration(
+            main={"format": PICAMERA_MAIN_FORMAT, "size": size},
+            buffer_count=buffer_count,
+        )
+    picam2.configure(config)
+    return config
 
 
 def gray_world_white_balance_rgb(rgb: np.ndarray, strength: float) -> np.ndarray:
@@ -185,3 +222,58 @@ def log_color_pipeline_verification(stats: dict, *, detection_mode: str, face_pr
     )
     if face_probe_count == 0:
         print("  Face probe: no face in startup frame — detection mode may auto-fix when you appear")
+
+
+def apply_camera_controls(
+    picam2,
+    *,
+    awb_mode: str = "auto",
+    colour_gains: list[float] | None = None,
+    sharpness: float | None = 1.0,
+    noise_reduction: str = "high",
+) -> None:
+    """Apply libcamera ISP controls; skips unsupported options on older libcamera builds."""
+    try:
+        from libcamera import controls as lc
+    except ImportError:
+        return
+
+    awb_modes = {
+        "auto": lc.AwbModeEnum.Auto,
+        "daylight": lc.AwbModeEnum.Daylight,
+        "cloudy": lc.AwbModeEnum.Cloudy,
+        "tungsten": lc.AwbModeEnum.Tungsten,
+        "fluorescent": lc.AwbModeEnum.Fluorescent,
+        "incandescent": lc.AwbModeEnum.Incandescent,
+        "indoor": lc.AwbModeEnum.Indoor,
+    }
+    ctrl: dict = {}
+    if colour_gains and len(colour_gains) >= 2:
+        ctrl["AwbEnable"] = False
+        ctrl["ColourGains"] = (float(colour_gains[0]), float(colour_gains[1]))
+    else:
+        ctrl["AwbMode"] = awb_modes.get(str(awb_mode).lower(), lc.AwbModeEnum.Auto)
+    if sharpness is not None and float(sharpness) > 0:
+        ctrl["Sharpness"] = float(sharpness)
+
+    nr_enum = getattr(lc, "NoiseReductionModeEnum", None)
+    if nr_enum is None:
+        draft = getattr(lc, "draft", None)
+        nr_enum = getattr(draft, "NoiseReductionModeEnum", None) if draft else None
+    if nr_enum is not None and noise_reduction:
+        nr_modes = {
+            "off": nr_enum.Off,
+            "minimal": nr_enum.Minimal,
+            "fast": nr_enum.Fast,
+            "high": nr_enum.HighQuality,
+            "highquality": nr_enum.HighQuality,
+        }
+        nr = nr_modes.get(str(noise_reduction).lower())
+        if nr is not None:
+            ctrl["NoiseReductionMode"] = nr
+
+    try:
+        picam2.set_controls(ctrl)
+        print(f"Camera controls: {ctrl}")
+    except Exception as exc:
+        print(f"Warning: camera controls not applied: {exc}")

@@ -19,13 +19,16 @@ camera:
   body_detect_stride: 2
   body_track_servo_alpha: 0.30
   body_aim_y_ratio: 0.22
-  main_res: [1280, 720]
-  detect_res: [640, 360]
-  stream_res: [320, 180]
-  confidence_threshold: 0.6
+  use_preview_pipeline: true  # rpicam-hello style ISP (XBGR8888/sRGB, full denoise)
+  main_res: [1640, 1232]       # full IMX219 sensor — same FOV as rpicam-hello
+  detect_res: [1280, 720]      # match v2 — better close-range YuNet hits than 640x480
+  stream_res: [1280, 960]      # downscale for MJPEG; set to main_res for max quality
+  sharpness: 1.0
+  noise_reduction: high
+  confidence_threshold: 0.45
   nms_threshold: 0.3
   rotate_180: true
-  stream_swap_rb: true
+  stream_swap_rb: false         # not needed with preview pipeline (BGRA→RGB)
   awb_mode: auto
   colour_gains: null
   stream_white_balance: false
@@ -34,9 +37,9 @@ camera:
 stream:
   enabled: true
   host: "0.0.0.0"
-  port: 8080
-  fps: 8
-  jpeg_quality: 70
+  port: 8090  # robot debug/MJPEG; frontend assets use image_server on 8080
+  fps: 10
+  jpeg_quality: 95
   render_fps: 24
   vision_fps: 10
 
@@ -304,3 +307,19 @@ tof:
   debounce_absent_sec: 0.5
   labels: [left, center, right]
   mux_channels: [0, 1, 2]
+  approach:
+    enabled: true
+    head_turn_deg: 30.0
+    pan_step_deg: 4.0
+    boot_pan_step_deg: 30.0
+    arrival_deg: 3.0
+    use_base: true
+    base_nudge_deg: 12.0
+    max_base_nudges_per_event: 1
+    confirm_delay_sec: 0.6
+    lockout_sec: 10.0
+    left_right_only: true
+    boot_orient: true
+    startup_grace_sec: 2.5
+    boot_orient_delay_sec: 0.4
+    tilt_recenter_alpha: 0.22

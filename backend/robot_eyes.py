@@ -39,6 +39,7 @@ from elastic_head_motion import (
 )
 from head_servo_axes import check_servo_channel_config
 from tof_presence import TofPresenceTracker, TofSnapshot, TofPresence, sanitize_tof_snapshot
+from tof_approach import TofApproachController
 from animation_player import AnimationPlayer
 from botango_loader import (
     DEFAULT_ARM_NEUTRALS,
@@ -49,7 +50,16 @@ from botango_loader import (
     servo_stop_pose,
 )
 from person_detector import PersonDetector
-from camera_color import PICAMERA_MAIN_FORMAT
+from camera_color import (
+    apply_camera_controls,
+    configure_picamera,
+    detect_faces_yunet,
+    frame_to_rgb,
+    log_color_pipeline_verification,
+    probe_yunet_bgr_mode,
+    to_detection_bgr,
+    verify_color_pipeline,
+)
 
 # Shared amplitude state written by the UDP thread, read by the render loop
 udp_emotion_override = None
@@ -123,12 +133,15 @@ BODY_AIM_Y_RATIO = _c.body_aim_y_ratio
 CAMERA_MAIN_RES = tuple(_c.main_res)
 CAMERA_RES = tuple(_c.detect_res)
 STREAM_RES = tuple(_c.stream_res)
+CAMERA_USE_PREVIEW = _c.use_preview_pipeline
 CONFIDENCE_THRESHOLD = _c.confidence_threshold
 NMS_THRESHOLD = _c.nms_threshold
 CAMERA_ROTATE_180 = _c.rotate_180
 STREAM_SWAP_RB = _c.stream_swap_rb
 CAMERA_AWB_MODE = _c.awb_mode
 CAMERA_COLOUR_GAINS = _c.colour_gains
+CAMERA_SHARPNESS = _c.sharpness
+CAMERA_NOISE_REDUCTION = _c.noise_reduction
 STREAM_WHITE_BALANCE = _c.stream_white_balance
 STREAM_WB_STRENGTH = _c.stream_wb_strength
 
@@ -375,6 +388,21 @@ TOF_ABSENT_MIN_MM = _tof.absent_min_mm
 TOF_MIN_VALID_MM = int(_tof.min_valid_mm)
 TOF_DEBOUNCE_PRESENT_SEC = _tof.debounce_present_sec
 TOF_DEBOUNCE_ABSENT_SEC = _tof.debounce_absent_sec
+_tof_approach = _tof.approach
+TOF_APPROACH_ENABLED = _tof_approach.enabled
+TOF_APPROACH_HEAD_TURN_DEG = _tof_approach.head_turn_deg
+TOF_APPROACH_PAN_STEP_DEG = _tof_approach.pan_step_deg
+TOF_APPROACH_BOOT_PAN_STEP_DEG = _tof_approach.boot_pan_step_deg
+TOF_APPROACH_ARRIVAL_DEG = _tof_approach.arrival_deg
+TOF_APPROACH_USE_BASE = _tof_approach.use_base
+TOF_APPROACH_BASE_NUDGE_DEG = _tof_approach.base_nudge_deg
+TOF_APPROACH_MAX_BASE_NUDGES = _tof_approach.max_base_nudges_per_event
+TOF_APPROACH_CONFIRM_DELAY_SEC = _tof_approach.confirm_delay_sec
+TOF_APPROACH_LOCKOUT_SEC = _tof_approach.lockout_sec
+TOF_APPROACH_LEFT_RIGHT_ONLY = _tof_approach.left_right_only
+TOF_APPROACH_BOOT_ORIENT = _tof_approach.boot_orient
+TOF_APPROACH_STARTUP_GRACE_SEC = _tof_approach.startup_grace_sec
+TOF_APPROACH_TILT_RECENTER_ALPHA = _tof_approach.tilt_recenter_alpha
 
 ENABLE_SERVO = _sv.enabled
 PAN_CH = _sv.pan_ch
@@ -725,6 +753,8 @@ def sync_config_from_cfg() -> None:
     STREAM_SWAP_RB = _c.stream_swap_rb
     CAMERA_AWB_MODE = _c.awb_mode
     CAMERA_COLOUR_GAINS = _c.colour_gains
+    CAMERA_SHARPNESS = _c.sharpness
+    CAMERA_NOISE_REDUCTION = _c.noise_reduction
     STREAM_WHITE_BALANCE = _c.stream_white_balance
     STREAM_WB_STRENGTH = _c.stream_wb_strength
     BODY_MODEL_PATH = _c.body_model_path
@@ -1338,8 +1368,25 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
 
 
 class MJPEGHandler(BaseHTTPRequestHandler):
+    def _json_safe(self, value):
+        """Coerce numpy scalars and other non-JSON types for API responses."""
+        if isinstance(value, dict):
+            return {k: self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        type_name = type(value).__name__
+        if type_name in ("bool_", "bool8"):
+            return bool(value)
+        if type_name.startswith("int"):
+            return int(value)
+        if type_name.startswith("float"):
+            return float(value)
+        return value
+
     def _send_json(self, payload: dict, status: int = 200):
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(self._json_safe(payload)).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
@@ -1408,6 +1455,14 @@ class MJPEGHandler(BaseHTTPRequestHandler):
 
         if path == "/api/tuning":
             self._send_json({"fields": get_tuning_schema(cfg)})
+            return
+
+        if path == "/api/tof":
+            self._send_json(get_tof_api_payload())
+            return
+
+        if path in ("/tof", "/tof_viz.html"):
+            self._serve_static("tof_viz.html", "text/html; charset=utf-8")
             return
 
         if path == "/stream":
@@ -1507,29 +1562,13 @@ if ENABLE_SERVO:
 
 def _apply_camera_colour_controls(picam2: Picamera2) -> None:
     """Set AWB / manual colour gains to reduce orange indoor cast."""
-    if libcamera_controls is None:
-        return
-    awb_modes = {
-        "auto": libcamera_controls.AwbModeEnum.Auto,
-        "daylight": libcamera_controls.AwbModeEnum.Daylight,
-        "cloudy": libcamera_controls.AwbModeEnum.Cloudy,
-        "tungsten": libcamera_controls.AwbModeEnum.Tungsten,
-        "fluorescent": libcamera_controls.AwbModeEnum.Fluorescent,
-        "incandescent": libcamera_controls.AwbModeEnum.Incandescent,
-        "indoor": libcamera_controls.AwbModeEnum.Indoor,
-    }
-    ctrl: dict = {}
-    if CAMERA_COLOUR_GAINS and len(CAMERA_COLOUR_GAINS) >= 2:
-        ctrl["AwbEnable"] = False
-        ctrl["ColourGains"] = (float(CAMERA_COLOUR_GAINS[0]), float(CAMERA_COLOUR_GAINS[1]))
-    else:
-        mode = awb_modes.get(str(CAMERA_AWB_MODE).lower(), libcamera_controls.AwbModeEnum.Auto)
-        ctrl["AwbMode"] = mode
-    try:
-        picam2.set_controls(ctrl)
-        print(f"Camera colour: {ctrl}")
-    except Exception as e:
-        print(f"Warning: camera colour controls not applied: {e}")
+    apply_camera_controls(
+        picam2,
+        awb_mode=CAMERA_AWB_MODE,
+        colour_gains=CAMERA_COLOUR_GAINS,
+        sharpness=CAMERA_SHARPNESS,
+        noise_reduction=CAMERA_NOISE_REDUCTION,
+    )
 
 
 # --- Camera & Face Detector Setup ---
@@ -1538,14 +1577,11 @@ picam2 = None
 try:
     picam2 = Picamera2()
     
-    config = picam2.create_video_configuration(
-        main={"format": PICAMERA_MAIN_FORMAT, "size": CAMERA_MAIN_RES},
-        buffer_count=1,
-    )
-    picam2.configure(config)
+    configure_picamera(picam2, CAMERA_MAIN_RES, use_preview_pipeline=CAMERA_USE_PREVIEW)
     picam2.start()
     _apply_camera_colour_controls(picam2)
-    print(f"Camera started: main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, detect {CAMERA_RES[0]}x{CAMERA_RES[1]}")
+    pipeline = "preview/sRGB" if CAMERA_USE_PREVIEW else "video/RGB888"
+    print(f"Camera started ({pipeline}): main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, detect {CAMERA_RES[0]}x{CAMERA_RES[1]}")
 except Exception as e:
     print(f"Error starting Picamera2: {e}")
     sys.exit(1)
@@ -1570,6 +1606,29 @@ try:
 except Exception as e:
     print(f"Error initializing detector: {e}")
     sys.exit(1)
+
+print("Probing YuNet BGR layout...")
+try:
+    _boot_capture = picam2.capture_array()
+    _boot_rgb = frame_to_rgb(
+        _boot_capture,
+        legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
+    )
+    _boot_detect = cv2.resize(_boot_rgb, CAMERA_RES, interpolation=cv2.INTER_AREA)
+    _detection_bgr_mode, _probe_face_count = probe_yunet_bgr_mode(
+        detector,
+        _boot_detect,
+        input_size=CAMERA_RES,
+        rotate_180=CAMERA_ROTATE_180,
+    )
+    _color_stats = verify_color_pipeline(_boot_rgb)
+    log_color_pipeline_verification(
+        _color_stats,
+        detection_mode=_detection_bgr_mode,
+        face_probe_count=_probe_face_count,
+    )
+except Exception as e:
+    print(f"Warning: face color probe skipped: {e}")
 
 person_detector = None
 if BODY_ENABLED:
@@ -1681,6 +1740,11 @@ chat_ready_until = 0.0
 wake_tilt_jerk_until = 0.0
 wake_request_ts = 0.0
 session_active = False
+PRESENCE_ARRIVAL_COOLDOWN_SEC = 45.0
+presence_arrival_last_ts = 0.0
+prev_tof_center_present = False
+_voice_notify_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+_VOICE_NOTIFY_ADDR = ("127.0.0.1", 9001)
 wander_search_phase = 0.0  # legacy
 wander_search_last_ts = time.time()
 organic_wander_search = OrganicWanderSearch()
@@ -1752,6 +1816,30 @@ tof_tracker = TofPresenceTracker(
     debounce_present_sec=TOF_DEBOUNCE_PRESENT_SEC,
     debounce_absent_sec=TOF_DEBOUNCE_ABSENT_SEC,
 )
+
+
+def _make_tof_approach_controller() -> TofApproachController:
+    return TofApproachController(
+        enabled=TOF_APPROACH_ENABLED and TOF_ENABLED,
+        head_turn_deg=TOF_APPROACH_HEAD_TURN_DEG,
+        present_max_mm=TOF_PRESENT_MAX_MM,
+        pan_step_deg=TOF_APPROACH_PAN_STEP_DEG,
+        boot_pan_step_deg=TOF_APPROACH_BOOT_PAN_STEP_DEG,
+        arrival_deg=TOF_APPROACH_ARRIVAL_DEG,
+        use_base=TOF_APPROACH_USE_BASE,
+        base_nudge_deg=TOF_APPROACH_BASE_NUDGE_DEG,
+        max_base_nudges_per_event=TOF_APPROACH_MAX_BASE_NUDGES,
+        confirm_delay_sec=TOF_APPROACH_CONFIRM_DELAY_SEC,
+        lockout_sec=TOF_APPROACH_LOCKOUT_SEC,
+        left_right_only=TOF_APPROACH_LEFT_RIGHT_ONLY,
+        boot_orient=TOF_APPROACH_BOOT_ORIENT,
+        startup_grace_sec=TOF_APPROACH_STARTUP_GRACE_SEC,
+        pan_min=PAN_MIN,
+        pan_max=PAN_MAX,
+    )
+
+
+tof_approach_controller = _make_tof_approach_controller()
 
 
 def clamp(value, lo, hi):
@@ -2032,6 +2120,7 @@ def _maybe_search_base_fov_nudge(
         or servo_driver is None
         or face_locked
         or mode != "wandering"
+        or tof_approach_controller.suppresses_wander_base()
     ):
         return
     if not hasattr(servo_driver, "write_base_relative_clamped"):
@@ -2104,6 +2193,7 @@ def _maybe_wander_base_follow_nudge(
         or servo_driver is None
         or face_locked
         or mode != "wandering"
+        or tof_approach_controller.suppresses_wander_base()
     ):
         return
     if not hasattr(servo_driver, "write_base_relative_clamped"):
@@ -2256,17 +2346,45 @@ def _load_default_animation_clips() -> int:
     return loaded
 
 
+def get_tof_api_payload() -> dict:
+    """Flat ToF snapshot for radar viz (/api/tof)."""
+    with tof_lock:
+        snap = tof_snapshot.as_dict()
+        pres = tof_presence.as_dict()
+        bearing = tof_approach_controller.last_bearing_deg
+        approach_active = bool(tof_approach_controller.active)
+        phase = tof_approach_controller.phase_name()
+        latched = tof_approach_controller.latched_sector
+    return {
+        **snap,
+        "presence": pres,
+        "bearing_deg": bearing,
+        "target_pan_offset_deg": bearing,
+        "approach_active": approach_active,
+        "approach_phase": phase,
+        "latched_sector": latched,
+        "enabled": bool(TOF_ENABLED),
+        "use_base": bool(TOF_APPROACH_USE_BASE),
+    }
+
+
 def get_tof_state() -> dict:
     with tof_lock:
         return {
-            "enabled": TOF_ENABLED,
+            "enabled": bool(TOF_ENABLED),
             "snapshot": tof_snapshot.as_dict(),
             "presence": tof_presence.as_dict(),
+            "bearing_deg": tof_approach_controller.last_bearing_deg,
+            "target_pan_offset_deg": tof_approach_controller.last_bearing_deg,
+            "approach_active": bool(tof_approach_controller.active),
+            "approach_phase": tof_approach_controller.phase_name(),
+            "latched_sector": tof_approach_controller.latched_sector,
+            "use_base": bool(TOF_APPROACH_USE_BASE),
         }
 
 
 def tof_worker():
-    global tof_snapshot, tof_presence
+    global tof_snapshot, tof_presence, prev_tof_center_present
     if not TOF_ENABLED or servo_driver is None:
         return
     interval = 1.0 / max(0.5, float(TOF_POLL_HZ))
@@ -2283,12 +2401,78 @@ def tof_worker():
                 with tof_lock:
                     tof_snapshot = snap
                     tof_presence = presence
+                    center_rising = presence.center and not prev_tof_center_present
+                    prev_tof_center_present = presence.center
+                tof_approach_controller.sync_presence(presence, time.time())
+                if center_rising:
+                    _notify_voice_presence_arrival(time.time())
         except Exception as e:
             now = time.time()
             if now - last_error_log > 5.0:
                 print(f"ToF poll error: {e}")
                 last_error_log = now
         time.sleep(interval)
+
+
+def _tof_approach_skip_motion(now: float) -> bool:
+    return (
+        no_face_mode == "sad_return"
+        or now < jerk_until
+        or gaze_event_active
+    )
+
+
+def _apply_tof_approach_action(action, now: float) -> None:
+    """Update head pan/tilt toward sector look angle (eye level, head servos)."""
+    global servo_target_pan, servo_target_tilt
+    _, tilt_center = head_center_angles()
+    with servo_state_lock:
+        if abs(action.pan_delta_deg) >= 0.05:
+            servo_target_pan = clamp(
+                servo_target_pan + action.pan_delta_deg,
+                PAN_MIN,
+                PAN_MAX,
+            )
+        if tof_approach_controller.drives_motion() or abs(action.pan_delta_deg) >= 0.05:
+            alpha = max(0.05, TOF_APPROACH_TILT_RECENTER_ALPHA)
+            servo_target_tilt += (tilt_center - servo_target_tilt) * alpha
+    if abs(action.base_nudge_deg) >= 0.2 and BASE_ENABLED:
+        ok = _apply_wander_base_nudge(action.base_nudge_deg, now)
+        if not ok:
+            print(
+                f"ToF base nudge failed ({action.base_nudge_deg:+.1f}°) "
+                f"sector={tof_approach_controller.latched_sector}"
+            )
+        else:
+            print(
+                f"ToF base nudge {action.base_nudge_deg:+.1f}° "
+                f"sector={tof_approach_controller.latched_sector}"
+            )
+
+
+def _maybe_tof_approach_turn(
+    pan_current: float,
+    *,
+    pan_target: float | None = None,
+    face_locked: bool,
+    now: float,
+) -> None:
+    if not TOF_APPROACH_ENABLED or not TOF_ENABLED:
+        return
+    with tof_lock:
+        snap = tof_snapshot
+        pres = tof_presence
+        action = tof_approach_controller.tick(
+            snap,
+            pres,
+            face_locked=face_locked,
+            pan_current=pan_current,
+            pan_target=pan_target,
+            skip_motion=_tof_approach_skip_motion(now),
+            now=now,
+        )
+    if action is not None:
+        _apply_tof_approach_action(action, now)
 
 
 def servo_worker():
@@ -2301,6 +2485,21 @@ def servo_worker():
         return
 
     while servo_running:
+        now = time.time()
+
+        with target_lock:
+            face_locked = target_face_present
+
+        with servo_state_lock:
+            pan_current = servo_current_pan
+            pan_target = servo_target_pan
+        _maybe_tof_approach_turn(
+            pan_current,
+            pan_target=pan_target,
+            face_locked=face_locked,
+            now=now,
+        )
+
         with servo_state_lock:
             pan_target = servo_target_pan
             tilt_target = servo_target_tilt
@@ -2310,7 +2509,6 @@ def servo_worker():
             tilt_avert = servo_aversion_tilt_offset
 
         # Apply jerk oscillation if active
-        now = time.time()
         jerk_offset = 0.0
         if now < jerk_until and jerk_direction != 0.0:
             # Elapsed time within jerk window (0.0 to JERK_DURATION)
@@ -2319,9 +2517,6 @@ def servo_worker():
             phase = elapsed / JERK_DURATION
             # Sine wave oscillation: quick outward jerk, return, small reverse jerk
             jerk_offset = jerk_direction * JERK_AMPLITUDE * math.sin(phase * math.pi * 2.0)
-
-        with target_lock:
-            face_locked = target_face_present
 
         # Conversation-state nods — not while face locked, sad return, or settled idle.
         conv_tilt = 0.0
@@ -2450,11 +2645,12 @@ def servo_worker():
             face_locked=face_locked,
             mode=no_face_mode,
         )
-        _maybe_wander_base_follow_nudge(
-            pan_current,
-            face_locked=face_locked,
-            mode=no_face_mode,
-        )
+        if not tof_approach_controller.active:
+            _maybe_wander_base_follow_nudge(
+                pan_current,
+                face_locked=face_locked,
+                mode=no_face_mode,
+            )
 
         global _last_sent_pan, _last_sent_tilt
         head_moved = (
@@ -2622,6 +2818,25 @@ def get_runtime_state() -> dict:
     }
 
 
+def _notify_voice_presence_arrival(now: float) -> None:
+    """Tell voice_agent someone approached during an active LiveKit session."""
+    global presence_arrival_last_ts
+    if not session_active:
+        return
+    if udp_conv_state == "speaking":
+        return
+    if now - presence_arrival_last_ts < PRESENCE_ARRIVAL_COOLDOWN_SEC:
+        return
+    presence_arrival_last_ts = now
+    try:
+        _voice_notify_sock.sendto(
+            json.dumps({"command": "presence_arrival"}).encode("utf-8"),
+            _VOICE_NOTIFY_ADDR,
+        )
+    except OSError:
+        pass
+
+
 def udp_worker():
     global udp_emotion_override, udp_emotion_until, udp_speak_pulse
     global amplitude_fast, amplitude_slow
@@ -2707,10 +2922,8 @@ def vision_worker():
         try:
             vision_frame_idx += 1
             large_frame = picam2.capture_array()
-            frame_raw = cv2.resize(large_frame, CAMERA_RES)
-            frame = frame_raw
-            if CAMERA_ROTATE_180:
-                frame = cv2.rotate(frame_raw, cv2.ROTATE_180)
+            rgb_frame = frame_to_rgb(large_frame, legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW)
+            frame_raw = cv2.resize(rgb_frame, CAMERA_RES, interpolation=cv2.INTER_AREA)
 
             local_x = 0.0
             local_y = 0.0
@@ -2721,20 +2934,24 @@ def vision_worker():
             face_area_ratio = 0.0
             face_count = 0
 
-            if frame is not None and frame.size > 0:
+            if frame_raw is not None and frame_raw.size > 0:
                 stream_frame = None
                 if STREAM_ENABLED:
-                    stream_source = frame_raw if CAMERA_ROTATE_180 else frame
-                    stream_frame = cv2.resize(stream_source, STREAM_RES)
-                    if STREAM_SWAP_RB:
-                        stream_frame = cv2.cvtColor(stream_frame, cv2.COLOR_BGR2RGB)
+                    # Preview: natural sensor orientation (upright). Detection uses rotated frame.
+                    if STREAM_RES == CAMERA_MAIN_RES:
+                        stream_frame = rgb_frame.copy()
+                    else:
+                        stream_frame = cv2.resize(rgb_frame, STREAM_RES, interpolation=cv2.INTER_AREA)
 
-                detector.setInputSize((frame.shape[1], frame.shape[0]))
-                faces = detector.detect(frame)
+                detected_faces, _ = detect_faces_yunet(
+                    detector,
+                    frame_raw,
+                    input_size=CAMERA_RES,
+                    rotate_180=CAMERA_ROTATE_180,
+                )
 
-                if faces[1] is not None:
+                if detected_faces is not None:
                     has_face = True
-                    detected_faces = faces[1]
                     face_count = len(detected_faces)
                     largest_face = max(detected_faces, key=lambda f: f[2] * f[3])
 
@@ -2785,7 +3002,9 @@ def vision_worker():
                         and person_detector is not None
                         and vision_frame_idx % max(1, BODY_DETECT_STRIDE) == 0
                     ):
-                        body_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                        body_bgr = to_detection_bgr(
+                            frame_raw, rotate_180=CAMERA_ROTATE_180
+                        )
                         _last_body_det = person_detector.detect_largest(body_bgr)
                         _last_body_det_ts = time.time()
 
@@ -2873,8 +3092,14 @@ def vision_worker():
                         pan_center + NO_FACE_IDLE_PAN_DEG, PAN_MIN, PAN_MAX
                     )
                     tilt_idle = _tilt_down_from_center(NO_FACE_IDLE_TILT_DEG)
+                    with tof_lock:
+                        tof_drives_motion = (
+                            TOF_APPROACH_ENABLED
+                            and TOF_ENABLED
+                            and tof_approach_controller.drives_motion()
+                        )
                     with servo_state_lock:
-                        if no_face_mode == "wandering":
+                        if no_face_mode == "wandering" and not tof_drives_motion:
                             global organic_wander_search, search_tilt_from_eye_level_deg
                             global wander_pan_speed_scale
                             pan_current = servo_current_pan
@@ -2991,6 +3216,11 @@ def _start_servo_hardware(driver) -> None:
     if TOF_ENABLED:
         threading.Thread(target=tof_worker, daemon=True).start()
         print(f"ToF presence polling at {TOF_POLL_HZ:.1f} Hz (ESP32 F command)")
+        if TOF_APPROACH_ENABLED:
+            print(
+                "ToF approach awareness enabled "
+                f"(grace {TOF_APPROACH_STARTUP_GRACE_SEC:.1f}s, one-shot orient)"
+            )
 
 
 def _servo_connect_worker() -> None:
@@ -3132,6 +3362,7 @@ try:
 
         if face_stable_entered:
             face_present_since_ts = now
+            _notify_voice_presence_arrival(now)
             face_acquire_until = now + FACE_ACQUIRE_SNAP_DURATION_SEC
             gaze_next_release_ts = now + random.uniform(GAZE_SOCIAL_RELEASE_MIN_SEC, GAZE_SOCIAL_RELEASE_MAX_SEC)
             gaze_next_scan_ts = now + FACE_SCAN_COOLDOWN_AFTER_LOCK_SEC

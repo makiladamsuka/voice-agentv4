@@ -29,13 +29,13 @@ class TofSnapshot:
 
     def as_dict(self) -> dict:
         return {
-            "left_mm": self.left_mm,
-            "center_mm": self.center_mm,
-            "right_mm": self.right_mm,
-            "left_valid": self.left_valid,
-            "center_valid": self.center_valid,
-            "right_valid": self.right_valid,
-            "timestamp": self.timestamp,
+            "left_mm": int(self.left_mm),
+            "center_mm": int(self.center_mm),
+            "right_mm": int(self.right_mm),
+            "left_valid": bool(self.left_valid),
+            "center_valid": bool(self.center_valid),
+            "right_valid": bool(self.right_valid),
+            "timestamp": float(self.timestamp),
         }
 
 
@@ -49,11 +49,11 @@ class TofPresence:
 
     def as_dict(self) -> dict:
         return {
-            "left": self.left,
-            "center": self.center,
-            "right": self.right,
-            "any_present": self.any_present,
-            "count_present": self.count_present,
+            "left": bool(self.left),
+            "center": bool(self.center),
+            "right": bool(self.right),
+            "any_present": bool(self.any_present),
+            "count_present": int(self.count_present),
         }
 
 

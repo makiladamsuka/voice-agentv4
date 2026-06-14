@@ -67,9 +67,12 @@ class CameraConfig:
     body_detect_stride: int = 2
     body_track_servo_alpha: float = 0.30
     body_aim_y_ratio: float = 0.22
-    main_res: list[int] = field(default_factory=lambda: [1280, 720])
-    detect_res: list[int] = field(default_factory=lambda: [960, 540])
-    stream_res: list[int] = field(default_factory=lambda: [320, 180])
+    use_preview_pipeline: bool = True
+    main_res: list[int] = field(default_factory=lambda: [1640, 1232])
+    detect_res: list[int] = field(default_factory=lambda: [1280, 720])
+    stream_res: list[int] = field(default_factory=lambda: [1280, 960])
+    sharpness: float = 1.0
+    noise_reduction: str = "high"
     confidence_threshold: float = 0.32
     nms_threshold: float = 0.3
     rotate_180: bool = True
@@ -84,7 +87,7 @@ class CameraConfig:
 class StreamConfig:
     enabled: bool = True
     host: str = "0.0.0.0"
-    port: int = 8080
+    port: int = 8090
     fps: int = 8
     jpeg_quality: int = 70
     render_fps: int = 24
@@ -340,6 +343,30 @@ class BaseConfig:
 
 
 @dataclass
+class TofApproachConfig:
+    enabled: bool = True
+    head_turn_deg: float = 30.0
+    pan_step_deg: float = 4.0
+    boot_pan_step_deg: float = 30.0
+    arrival_deg: float = 3.0
+    use_base: bool = True
+    base_nudge_deg: float = 12.0
+    max_base_nudges_per_event: int = 1
+    confirm_delay_sec: float = 0.6
+    lockout_sec: float = 10.0
+    left_right_only: bool = True
+    boot_orient: bool = True
+    startup_grace_sec: float = 2.5
+    boot_orient_delay_sec: float = 0.4
+    tilt_recenter_alpha: float = 0.22
+    turn_cooldown_sec: float = 1.5
+    # Legacy keys kept so older config.yaml entries merge without error.
+    sensor_azimuth_deg: list[float] = field(default_factory=lambda: [-45.0, 0.0, 45.0])
+    base_turn_threshold_deg: float = 10.0
+    bearing_deadband_deg: float = 5.0
+
+
+@dataclass
 class TofConfig:
     enabled: bool = True
     poll_hz: float = 5.0
@@ -350,6 +377,7 @@ class TofConfig:
     debounce_absent_sec: float = 0.5
     labels: list[str] = field(default_factory=lambda: ["left", "center", "right"])
     mux_channels: list[int] = field(default_factory=lambda: [0, 1, 2])
+    approach: TofApproachConfig = field(default_factory=TofApproachConfig)
 
 
 @dataclass
