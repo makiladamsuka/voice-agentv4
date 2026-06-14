@@ -1,8 +1,22 @@
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 EYES_START_DELAY_SEC = 15
+
+
+def _warm_event_database():
+    """Index posters on disk before the LiveKit worker starts."""
+    print("Indexing event posters (runs once at robot startup)...")
+    try:
+        from event_database import build_event_database
+
+        assets_dir = Path(__file__).parent / "assets"
+        build_event_database(assets_dir)
+        print("Event database ready")
+    except Exception as exc:
+        print(f"Event indexing failed (worker will retry in prewarm): {exc}")
 
 
 def start_services():
@@ -10,7 +24,9 @@ def start_services():
     print("   Frontend assets: http://<pi-ip>:8080/assets/")
     print("   Robot debug:     http://<pi-ip>:8090/debug")
 
-    print("Starting LiveKit Voice Agent (image server on :8080)...")
+    _warm_event_database()
+
+    print("Starting LiveKit Voice Agent (prewarming worker, image server on :8080)...")
     voice_proc = subprocess.Popen([sys.executable, "voice_agent.py", "dev"])
 
     print(

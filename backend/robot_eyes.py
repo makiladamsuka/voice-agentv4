@@ -52,13 +52,20 @@ from botango_loader import (
 from person_detector import PersonDetector
 from camera_color import (
     apply_camera_controls,
+    assert_detection_aspect_matches,
     configure_picamera,
+    configure_wide_fov_camera,
     detect_faces_yunet,
+    detect_faces_yunet_fast,
     frame_to_rgb,
     log_color_pipeline_verification,
     probe_yunet_bgr_mode,
     to_detection_bgr,
     verify_color_pipeline,
+)
+from surroundings_emotion import (
+    SurroundingsEmotionConfig as SurroundingsEmotionRuntimeConfig,
+    SurroundingsEmotionController,
 )
 
 # Shared amplitude state written by the UDP thread, read by the render loop
@@ -113,6 +120,7 @@ _gz = cfg.gaze
 _sv = cfg.servo
 _base = cfg.base
 _tof = cfg.tof
+_se = cfg.surroundings_emotion
 
 SCREEN_WIDTH = _d.screen_width
 SCREEN_HEIGHT = _d.screen_height
@@ -133,7 +141,9 @@ BODY_AIM_Y_RATIO = _c.body_aim_y_ratio
 CAMERA_MAIN_RES = tuple(_c.main_res)
 CAMERA_RES = tuple(_c.detect_res)
 STREAM_RES = tuple(_c.stream_res)
-CAMERA_USE_PREVIEW = _c.use_preview_pipeline
+CAMERA_WIDE_FOV = _c.wide_fov
+CAMERA_RAW_SENSOR_RES = tuple(_c.raw_sensor_res)
+CAMERA_USE_PREVIEW = _c.use_preview_pipeline and not CAMERA_WIDE_FOV
 CONFIDENCE_THRESHOLD = _c.confidence_threshold
 NMS_THRESHOLD = _c.nms_threshold
 CAMERA_ROTATE_180 = _c.rotate_180
@@ -1424,10 +1434,16 @@ class MJPEGHandler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
                     continue
 
-                img = Image.fromarray(frame)
-                buf = io.BytesIO()
-                img.save(buf, format="JPEG", quality=STREAM_JPEG_QUALITY)
-                jpg = buf.getvalue()
+                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                ok, buf = cv2.imencode(
+                    ".jpg",
+                    bgr,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), int(STREAM_JPEG_QUALITY)],
+                )
+                if not ok:
+                    time.sleep(0.05)
+                    continue
+                jpg = buf.tobytes()
 
                 self.wfile.write(b"--frame\r\n")
                 self.wfile.write(b"Content-Type: image/jpeg\r\n")
@@ -1576,14 +1592,37 @@ print("Initializing Picamera2...")
 picam2 = None
 try:
     picam2 = Picamera2()
-    
-    configure_picamera(picam2, CAMERA_MAIN_RES, use_preview_pipeline=CAMERA_USE_PREVIEW)
+
+    if CAMERA_WIDE_FOV:
+        configure_wide_fov_camera(
+            picam2,
+            CAMERA_MAIN_RES,
+            raw_sensor_res=CAMERA_RAW_SENSOR_RES,
+        )
+        pipeline = f"wide-FOV video/RGB888 raw {CAMERA_RAW_SENSOR_RES[0]}x{CAMERA_RAW_SENSOR_RES[1]}"
+    else:
+        configure_picamera(picam2, CAMERA_MAIN_RES, use_preview_pipeline=CAMERA_USE_PREVIEW)
+        pipeline = "preview/sRGB" if CAMERA_USE_PREVIEW else "video/RGB888"
     picam2.start()
     _apply_camera_colour_controls(picam2)
-    pipeline = "preview/sRGB" if CAMERA_USE_PREVIEW else "video/RGB888"
-    print(f"Camera started ({pipeline}): main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, detect {CAMERA_RES[0]}x{CAMERA_RES[1]}")
+    if CAMERA_WIDE_FOV:
+        print(
+            f"Camera started ({pipeline}): "
+            f"main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, "
+            f"detect {CAMERA_RES[0]}x{CAMERA_RES[1]}"
+        )
+        print("  Tip: full-sensor mode needs cma=256 in /boot/firmware/config.txt")
+    else:
+        print(
+            f"Camera started ({pipeline}): "
+            f"main {CAMERA_MAIN_RES[0]}x{CAMERA_MAIN_RES[1]}, "
+            f"detect {CAMERA_RES[0]}x{CAMERA_RES[1]}"
+        )
+    assert_detection_aspect_matches(CAMERA_MAIN_RES, CAMERA_RES, stream_res=STREAM_RES)
 except Exception as e:
     print(f"Error starting Picamera2: {e}")
+    if CAMERA_WIDE_FOV:
+        print("  If capture failed, add cma=256 to /boot/firmware/config.txt and reboot.")
     sys.exit(1)
 
 print("Initializing YuNet Face Detector...")
@@ -1610,16 +1649,26 @@ except Exception as e:
 print("Probing YuNet BGR layout...")
 try:
     _boot_capture = picam2.capture_array()
-    _boot_rgb = frame_to_rgb(
-        _boot_capture,
-        legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
-    )
-    _boot_detect = cv2.resize(_boot_rgb, CAMERA_RES, interpolation=cv2.INTER_AREA)
+    if CAMERA_WIDE_FOV:
+        _boot_detect = cv2.resize(_boot_capture, CAMERA_RES, interpolation=cv2.INTER_AREA)
+        if CAMERA_ROTATE_180:
+            _boot_detect = cv2.rotate(_boot_detect, cv2.ROTATE_180)
+        _boot_rgb = (
+            cv2.cvtColor(_boot_detect, cv2.COLOR_BGR2RGB)
+            if STREAM_SWAP_RB
+            else _boot_detect
+        )
+    else:
+        _boot_rgb = frame_to_rgb(
+            _boot_capture,
+            legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
+        )
+        _boot_detect = cv2.resize(_boot_rgb, CAMERA_RES, interpolation=cv2.INTER_AREA)
     _detection_bgr_mode, _probe_face_count = probe_yunet_bgr_mode(
         detector,
         _boot_detect,
         input_size=CAMERA_RES,
-        rotate_180=CAMERA_ROTATE_180,
+        rotate_180=False if CAMERA_WIDE_FOV else CAMERA_ROTATE_180,
     )
     _color_stats = verify_color_pipeline(_boot_rgb)
     log_color_pipeline_verification(
@@ -1663,6 +1712,28 @@ right_eye.rot_speed = left_eye.rot_speed
 right_eye.happy_phase = left_eye.happy_phase
 left_eye.set_emotion("idle", EMOTION_INTENSITY["idle"])
 right_eye.set_emotion("idle", EMOTION_INTENSITY["idle"])
+
+surroundings_controller = SurroundingsEmotionController(
+    cfg=SurroundingsEmotionRuntimeConfig(
+        no_face_grace_sec=_se.no_face_grace_sec,
+        no_person_hold_min_sec=_se.no_person_hold_min_sec,
+        no_person_hold_max_sec=_se.no_person_hold_max_sec,
+        person_hold_min_sec=_se.person_hold_min_sec,
+        person_hold_max_sec=_se.person_hold_max_sec,
+        direction_trigger_norm_x=_se.direction_trigger_norm_x,
+        direction_hold_min_sec=_se.direction_hold_min_sec,
+        direction_hold_max_sec=_se.direction_hold_max_sec,
+        direction_cooldown_sec=_se.direction_cooldown_sec,
+        close_face_enter_ratio=_se.close_face_enter_ratio,
+        far_face_area_ratio=_se.far_face_area_ratio,
+        near_exit_ratio=_se.near_exit_ratio,
+        far_exit_ratio=_se.far_exit_ratio,
+        emotion_history_len=_se.emotion_history_len,
+    )
+)
+prev_surroundings_x = 0.0
+prev_surroundings_y = 0.0
+prev_surroundings_rot = 0.0
 
 # Animation Loop Vars
 running = True
@@ -1880,6 +1951,26 @@ def is_upbeat_session() -> bool:
         or no_face_mode == "chat_ready"
         or udp_conv_state in AWAKE_CONV_ACTIVE
     )
+
+
+def voice_emotion_active(now: float) -> bool:
+    """Voice agent UDP layers take priority over surroundings-driven emotions."""
+    if session_active:
+        return True
+    if udp_emotion_override and now < udp_emotion_until:
+        return True
+    if udp_conv_state in (
+        "listening",
+        "speaking",
+        "thinking",
+        "nodding",
+        "remembering",
+        "concentrating",
+    ):
+        return True
+    if udp_conv_state == "waiting" and udp_conv_emotion == "awkward":
+        return True
+    return False
 
 
 def trace_emotion(step: str, emotion: str):
@@ -2886,10 +2977,19 @@ def udp_worker():
         except Exception:
             pass
 
+# MJPEG debug overlay colors (cv2 BGR tuples on RGB stream buffer → see comment)
+# Face: green box + yellow eye dots | Body: magenta box + magenta aim dot
+_FACE_BOX_BGR = (0, 255, 0)
+_FACE_EYE_BGR = (0, 255, 255)
+_BODY_BOX_BGR = (255, 0, 255)
+_BODY_AIM_BGR = (255, 0, 255)
+_DEBUG_OVERLAY_THICKNESS = 3
+
+
 def map_coords_to_stream_preview(fx, fy, fw, fh, re_x, re_y, le_x, le_y):
-    """Map detection coords on rotated frame to unrotated stream preview."""
+    """Map detection coords to MJPEG stream (same oriented frame when wide FOV)."""
     w, h = CAMERA_RES[0], CAMERA_RES[1]
-    if CAMERA_ROTATE_180:
+    if not CAMERA_WIDE_FOV and CAMERA_ROTATE_180:
         fx = w - fx - fw
         fy = h - fy - fh
         re_x, re_y = w - re_x, h - re_y
@@ -2902,6 +3002,49 @@ def map_coords_to_stream_preview(fx, fy, fw, fh, re_x, re_y, le_x, le_y):
         int(re_x * scale_x), int(re_y * scale_y),
         int(le_x * scale_x), int(le_y * scale_y),
     )
+
+
+def _prepare_vision_frames(large_frame):
+    """Return (detect_frame, stream_frame) for the active camera pipeline."""
+    if CAMERA_WIDE_FOV:
+        frame = cv2.resize(large_frame, CAMERA_RES, interpolation=cv2.INTER_AREA)
+        if CAMERA_ROTATE_180:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        stream_frame = None
+        if STREAM_ENABLED:
+            stream_frame = cv2.resize(frame, STREAM_RES, interpolation=cv2.INTER_AREA)
+            if STREAM_SWAP_RB:
+                stream_frame = cv2.cvtColor(stream_frame, cv2.COLOR_BGR2RGB)
+        return frame, stream_frame
+
+    rgb_frame = frame_to_rgb(
+        large_frame,
+        legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
+    )
+    frame_raw = cv2.resize(rgb_frame, CAMERA_RES, interpolation=cv2.INTER_AREA)
+    stream_frame = None
+    if STREAM_ENABLED:
+        if STREAM_RES == CAMERA_MAIN_RES:
+            stream_frame = rgb_frame.copy()
+        else:
+            stream_frame = cv2.resize(rgb_frame, STREAM_RES, interpolation=cv2.INTER_AREA)
+    return frame_raw, stream_frame
+
+
+def _detect_faces_on_frame(frame_raw):
+    if CAMERA_WIDE_FOV:
+        return detect_faces_yunet_fast(
+            detector,
+            frame_raw,
+            input_size=CAMERA_RES,
+        )
+    detected_faces, _ = detect_faces_yunet(
+        detector,
+        frame_raw,
+        input_size=CAMERA_RES,
+        rotate_180=CAMERA_ROTATE_180,
+    )
+    return detected_faces
 
 
 def vision_worker():
@@ -2922,8 +3065,7 @@ def vision_worker():
         try:
             vision_frame_idx += 1
             large_frame = picam2.capture_array()
-            rgb_frame = frame_to_rgb(large_frame, legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW)
-            frame_raw = cv2.resize(rgb_frame, CAMERA_RES, interpolation=cv2.INTER_AREA)
+            frame_raw, stream_frame = _prepare_vision_frames(large_frame)
 
             local_x = 0.0
             local_y = 0.0
@@ -2935,20 +3077,7 @@ def vision_worker():
             face_count = 0
 
             if frame_raw is not None and frame_raw.size > 0:
-                stream_frame = None
-                if STREAM_ENABLED:
-                    # Preview: natural sensor orientation (upright). Detection uses rotated frame.
-                    if STREAM_RES == CAMERA_MAIN_RES:
-                        stream_frame = rgb_frame.copy()
-                    else:
-                        stream_frame = cv2.resize(rgb_frame, STREAM_RES, interpolation=cv2.INTER_AREA)
-
-                detected_faces, _ = detect_faces_yunet(
-                    detector,
-                    frame_raw,
-                    input_size=CAMERA_RES,
-                    rotate_180=CAMERA_ROTATE_180,
-                )
+                detected_faces = _detect_faces_on_frame(frame_raw)
 
                 if detected_faces is not None:
                     has_face = True
@@ -2963,9 +3092,25 @@ def vision_worker():
                         fx_s, fy_s, fw_s, fh_s, re_x_s, re_y_s, le_x_s, le_y_s = map_coords_to_stream_preview(
                             fx, fy, fw, fh, re_x, re_y, le_x, le_y,
                         )
-                        cv2.rectangle(stream_frame, (fx_s, fy_s), (fx_s + fw_s, fy_s + fh_s), (0, 255, 0), 2)
-                        cv2.circle(stream_frame, (re_x_s, re_y_s), 5, (255, 0, 0), -1)
-                        cv2.circle(stream_frame, (le_x_s, le_y_s), 5, (255, 0, 0), -1)
+                        cv2.rectangle(
+                            stream_frame,
+                            (fx_s, fy_s),
+                            (fx_s + fw_s, fy_s + fh_s),
+                            _FACE_BOX_BGR,
+                            _DEBUG_OVERLAY_THICKNESS,
+                        )
+                        cv2.circle(stream_frame, (re_x_s, re_y_s), 6, _FACE_EYE_BGR, -1)
+                        cv2.circle(stream_frame, (le_x_s, le_y_s), 6, _FACE_EYE_BGR, -1)
+                        cv2.putText(
+                            stream_frame,
+                            "FACE",
+                            (fx_s, max(18, fy_s - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            _FACE_BOX_BGR,
+                            2,
+                            cv2.LINE_AA,
+                        )
 
                     face_cx = (fx + fw / 2) / CAMERA_RES[0]
                     face_cy = (fy + fh / 2) / CAMERA_RES[1]
@@ -3003,7 +3148,8 @@ def vision_worker():
                         and vision_frame_idx % max(1, BODY_DETECT_STRIDE) == 0
                     ):
                         body_bgr = to_detection_bgr(
-                            frame_raw, rotate_180=CAMERA_ROTATE_180
+                            frame_raw,
+                            rotate_180=False if CAMERA_WIDE_FOV else CAMERA_ROTATE_180,
                         )
                         _last_body_det = person_detector.detect_largest(body_bgr)
                         _last_body_det_ts = time.time()
@@ -3040,15 +3186,30 @@ def vision_worker():
                                 stream_frame,
                                 (bx_s, by_s),
                                 (bx_s + bw_s, by_s + bh_s),
-                                (255, 140, 0),
-                                2,
+                                _BODY_BOX_BGR,
+                                _DEBUG_OVERLAY_THICKNESS,
                             )
-                            ax_s = int((aim_cx / CAMERA_RES[0]) * STREAM_RES[0])
-                            ay_s = int((aim_cy / CAMERA_RES[1]) * STREAM_RES[1])
-                            if CAMERA_ROTATE_180:
-                                ax_s = STREAM_RES[0] - ax_s
-                                ay_s = STREAM_RES[1] - ay_s
-                            cv2.circle(stream_frame, (ax_s, ay_s), 4, (255, 140, 0), -1)
+                            ax_s, ay_s, _, _, _, _, _, _ = map_coords_to_stream_preview(
+                                int(aim_cx),
+                                int(aim_cy),
+                                0,
+                                0,
+                                int(aim_cx),
+                                int(aim_cy),
+                                0,
+                                0,
+                            )
+                            cv2.circle(stream_frame, (ax_s, ay_s), 6, _BODY_AIM_BGR, -1)
+                            cv2.putText(
+                                stream_frame,
+                                "BODY",
+                                (bx_s, max(18, by_s - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.7,
+                                _BODY_BOX_BGR,
+                                2,
+                                cv2.LINE_AA,
+                            )
 
                         local_x, local_y, _, _, _, _ = _apply_detection_aim_point(
                             aim_cx,
@@ -3530,9 +3691,43 @@ try:
         emotion_trace = []
         upbeat = is_upbeat_session()
         speak_da = amplitude_fast - amplitude_prev_fast
+        use_surroundings_emotions = not voice_emotion_active(now)
+
+        if use_surroundings_emotions:
+            dx_activity = abs(local_target_x - prev_surroundings_x) / max(1.0, float(MAX_X_OFFSET))
+            dy_activity = abs(local_target_y - prev_surroundings_y) / max(1.0, float(MAX_Y_OFFSET))
+            dr_activity = abs(local_target_rot - prev_surroundings_rot) / max(1.0, float(FACE_ROLL_MAX_DEG))
+            surroundings_activity = min(1.0, (dx_activity + dy_activity + dr_activity) / 3.0)
+            prev_surroundings_x = local_target_x
+            prev_surroundings_y = local_target_y
+            prev_surroundings_rot = local_target_rot
+
+            if no_face_mode == "sad_return" and not local_face_present:
+                target_emotion_raw = "sad"
+            elif no_face_mode == "wandering" and gaze_event_active and scan_emotion_override:
+                target_emotion_raw = scan_emotion_override
+            else:
+                surroundings_pick = surroundings_controller.tick(
+                    now=now,
+                    face_detected=local_face_present,
+                    face_area_ratio=local_face_area_ratio,
+                    face_norm_x=last_face_norm_x,
+                    squint_hint=1.0 if should_squint else 0.0,
+                    activity=surroundings_activity,
+                    wander_mode=no_face_mode == "wandering",
+                )
+                if surroundings_pick:
+                    target_emotion_raw = surroundings_pick
+                elif local_face_present:
+                    target_emotion_raw = surroundings_controller.current_emotion or FACE_TRACK_DEFAULT
+                elif no_face_mode == "settled":
+                    target_emotion_raw = settled_solo_emotion
+                else:
+                    target_emotion_raw = surroundings_controller.current_emotion or "idle"
+            trace_emotion("surroundings", target_emotion_raw)
 
         # Pick a short-lived social mode to keep expressions varied and lifelike.
-        if now >= social_mode_until:
+        if not use_surroundings_emotions and now >= social_mode_until:
             if local_face_present:
                 if router_face_close:
                     social_mode = weighted_pick([
@@ -3589,7 +3784,7 @@ try:
                 ])
             social_mode_until = now + random.uniform(SOCIAL_MODE_MIN_SEC, SOCIAL_MODE_MAX_SEC)
 
-        if not local_face_present:
+        if not use_surroundings_emotions and not local_face_present:
             no_face_elapsed_solo = now - no_face_since_ts
             block_solo_upbeat = (
                 no_face_mode in ("wandering", "sad_return", "settled")
@@ -3608,7 +3803,7 @@ try:
                 ])
                 solo_mood_until = now + random.uniform(SOCIAL_MODE_MIN_SEC, SOCIAL_MODE_MAX_SEC)
 
-        if local_face_present:
+        if not use_surroundings_emotions and local_face_present:
             if should_squint:
                 target_emotion_raw = "squint"
             elif router_face_close:
@@ -3623,7 +3818,7 @@ try:
                 target_emotion_raw = social_mode
             else:
                 target_emotion_raw = FACE_TRACK_DEFAULT
-        else:
+        elif not use_surroundings_emotions:
             no_face_elapsed = now - no_face_since_ts
             if no_face_mode == "sad_return":
                 target_emotion_raw = "sad"
@@ -3681,7 +3876,8 @@ try:
                 target_emotion_raw = SOLO_MOOD_TO_EMOTION[solo_mood]
             else:
                 target_emotion_raw = "idle"
-        trace_emotion("router_raw", target_emotion_raw)
+        if not use_surroundings_emotions:
+            trace_emotion("router_raw", target_emotion_raw)
 
         # Avoid repetitive smiling streaks by enforcing a happy cooldown.
         if (

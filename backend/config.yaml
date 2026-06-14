@@ -1,5 +1,8 @@
 # Robot eyes tuning — edit values here; restart robot_eyes.py to apply.
 # Phase 3 will add hot-reload for flagged fields.
+#
+# LOCKED: camera.* pipeline below (wide_fov, resolutions, rotate_180, stream_swap_rb).
+# Do not change during emotion/tracking/UI tweakings — only touch for hardware/mount fixes.
 
 display:
   screen_width: 128
@@ -19,16 +22,18 @@ camera:
   body_detect_stride: 2
   body_track_servo_alpha: 0.30
   body_aim_y_ratio: 0.22
-  use_preview_pipeline: true  # rpicam-hello style ISP (XBGR8888/sRGB, full denoise)
-  main_res: [1640, 1232]       # full IMX219 sensor — same FOV as rpicam-hello
-  detect_res: [1280, 720]      # match v2 — better close-range YuNet hits than 640x480
-  stream_res: [1280, 960]      # downscale for MJPEG; set to main_res for max quality
+  wide_fov: true                 # full sensor 3280x2464 crop — widest FOV (needs cma=256)
+  use_preview_pipeline: false   # wide FOV uses video RGB888 like trackingeyes2
+  main_res: [1920, 1080]        # 16:9 main stream
+  detect_res: [1280, 720]       # 16:9 YuNet (same aspect as main)
+  stream_res: [640, 360]        # 16:9 MJPEG preview
+  raw_sensor_res: [3280, 2464]  # IMX219 full sensor
   sharpness: 1.0
   noise_reduction: high
-  confidence_threshold: 0.45
+  confidence_threshold: 0.6
   nms_threshold: 0.3
-  rotate_180: true
-  stream_swap_rb: false         # not needed with preview pipeline (BGRA→RGB)
+  rotate_180: false              # set true if camera is mounted upside-down
+  stream_swap_rb: true           # RGB888 video path — swap for correct MJPEG colors
   awb_mode: auto
   colour_gains: null
   stream_white_balance: false
@@ -38,10 +43,10 @@ stream:
   enabled: true
   host: "0.0.0.0"
   port: 8090  # robot debug/MJPEG; frontend assets use image_server on 8080
-  fps: 10
-  jpeg_quality: 95
+  fps: 15                      # MJPEG send rate (re-serves latest vision frame)
+  jpeg_quality: 40             # low quality = smaller frames, less Pi CPU, more real-time
   render_fps: 24
-  vision_fps: 10
+  vision_fps: 10               # face/body detect rate (unchanged; stream reads latest_frame)
 
 eyes:
   max_x_offset: 30
@@ -180,6 +185,22 @@ face_tracking:
   awake_conv_active: [listening, speaking, thinking]
   no_face_recenter_sec: 1.5
   no_face_recenter_alpha: 0.06
+
+surroundings_emotion:
+  no_face_grace_sec: 0.9
+  no_person_hold_min_sec: 2.8
+  no_person_hold_max_sec: 5.2
+  person_hold_min_sec: 1.1
+  person_hold_max_sec: 2.8
+  direction_trigger_norm_x: 0.22
+  direction_hold_min_sec: 0.6
+  direction_hold_max_sec: 1.2
+  direction_cooldown_sec: 0.9
+  close_face_enter_ratio: 0.05
+  far_face_area_ratio: 0.018
+  near_exit_ratio: 0.041
+  far_exit_ratio: 0.0225
+  emotion_history_len: 3
 
 emotion:
   min_hold_sec: 0.70

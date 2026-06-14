@@ -7,6 +7,7 @@ from amplitude_tts import AmplitudeTTS, _drain_to_zero
 from text_filters import filter_leaked_tool_syntax
 from image_server import ImageServer
 from image_manager import ImageManager
+from map_navigation import MapNavigator
 from event_database import build_event_database
 from greetings import generate_presence_greeting
 import os
@@ -166,11 +167,13 @@ class CampusAgent(Agent, TimeTools, SearchTools):
         self.image_manager = ImageManager(assets_dir)
         self.image_server = image_server
         self.event_db = event_db
+        self.map_navigator = MapNavigator()
         self._room: rtc.Room | None = None
         self.content_tools = ContentTools(
             image_manager=self.image_manager,
             image_server=self.image_server,
             room_provider=lambda: self._room,
+            map_navigator=self.map_navigator,
         )
         super().__init__(instructions=SYSTEM_INSTRUCTIONS)
 
@@ -187,9 +190,32 @@ class CampusAgent(Agent, TimeTools, SearchTools):
         return await self.content_tools.show_event_poster(event_description, context)
 
     @function_tool
+    async def show_competition_poster(
+        self, competition_description: str, context: RunContext
+    ) -> str:
+        """Displays a competition poster on the frontend."""
+        return await self.content_tools.show_competition_poster(
+            competition_description, context
+        )
+
+    @function_tool
+    async def show_campus_post(self, post_description: str, context: RunContext) -> str:
+        """Displays a campus announcement poster on the frontend."""
+        return await self.content_tools.show_campus_post(post_description, context)
+
+    @function_tool
     async def show_location_map(self, location_query: str, context: RunContext) -> str:
         """Displays a campus location map on the frontend."""
         return await self.content_tools.show_location_map(location_query, context)
+
+    @function_tool
+    async def get_campus_directions(
+        self, start_location: str, destination: str, context: RunContext
+    ) -> str:
+        """Gives walking directions between two campus locations using the map graph."""
+        return await self.content_tools.get_campus_directions(
+            start_location, destination, context
+        )
 
     @function_tool
     async def ask_about_events(self, question: str, context: RunContext) -> str:
@@ -201,28 +227,30 @@ class CampusAgent(Agent, TimeTools, SearchTools):
         if not results:
             return "I couldn't find any specific events matching your question."
 
-        context_str = "Found these relevant events:\n"
+        context_str = "Found these relevant campus items:\n"
         for i, event in enumerate(results):
+            category = event.get("category", "event")
             context_str += (
-                f"{i + 1}. {event.get('title', 'Event')} on "
+                f"{i + 1}. [{category}] {event.get('title', 'Item')} on "
                 f"{event.get('date', 'Unknown Date')}: {event.get('description', '')}\n"
             )
         return context_str
 
 
-def _init_lightweight():
-    """Fast init before session.start — match v2 connect-first pattern."""
+def prewarm(proc: agents.JobProcess):
+    """Heavy init runs once per worker process before any frontend connect."""
+    print("Prewarming worker (image server, event DB, VAD)...")
+    _start_voice_listener_once()
     _init_image_server()
-
-
-async def _ensure_event_db(agent: CampusAgent):
-    global _global_event_db
-    if _global_event_db is not None:
-        agent.event_db = _global_event_db
-        return
-    loop = asyncio.get_event_loop()
-    _global_event_db = await loop.run_in_executor(None, _build_event_db_sync)
-    agent.event_db = _global_event_db
+    _build_event_db_sync()
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.1,
+        min_silence_duration=0.3,
+        prefix_padding_duration=0.2,
+    )
+    proc.userdata["image_server"] = _global_image_server
+    proc.userdata["event_db"] = _global_event_db
+    print("Prewarm complete — ready for instant LiveKit connect")
 
 
 async def _monitor_presence_greetings(session: AgentSession, ctx: agents.JobContext):
@@ -257,18 +285,23 @@ async def entrypoint(ctx: agents.JobContext):
 
     print(f"Job received: room={ctx.room.name}")
 
-    # Connect fast like v2 — defer heavy work until after session.start
-    _init_lightweight()
+    vad = ctx.proc.userdata.get("vad")
+    if vad is None:
+        print("Warning: VAD not prewarmed, loading on connect (slow)")
+        vad = silero.VAD.load(
+            min_speech_duration=0.1,
+            min_silence_duration=0.3,
+            prefix_padding_duration=0.2,
+        )
+
+    image_server = ctx.proc.userdata.get("image_server") or _global_image_server
+    event_db = ctx.proc.userdata.get("event_db") or _global_event_db
 
     session = AgentSession(
         turn_handling=agents.TurnHandlingOptions(interruption={"mode": "vad"}),
         stt=deepgram.STT(model="nova-3"),
         tts=AmplitudeTTS(model="aura-2-luna-en"),
-        vad=silero.VAD.load(
-            min_speech_duration=0.1,
-            min_silence_duration=0.3,
-            prefix_padding_duration=0.2,
-        ),
+        vad=vad,
         llm=openai.LLM(
             base_url="https://openrouter.ai/api/v1",
             api_key=os.getenv("OPENROUTER_API_KEY"),
@@ -281,8 +314,40 @@ async def entrypoint(ctx: agents.JobContext):
         ],
     )
 
-    agent = CampusAgent(_global_image_server, _global_event_db)
+    agent = CampusAgent(image_server, event_db)
     agent._room = ctx.room
+
+    @ctx.room.on("data_received")
+    def on_data_received(packet):
+        try:
+            payload = packet.data.decode("utf-8")
+            data = json.loads(payload)
+            if data.get("type") != "event_focus":
+                return
+            event = data.get("event", {})
+            title = event.get("message") or event.get("title") or "this item"
+            description = event.get("description", "")
+            date = event.get("extracted_date") or event.get("date", "")
+            location = event.get("extracted_location") or event.get("location", "")
+            category = event.get("category", "event")
+            detail_parts = []
+            if date:
+                detail_parts.append(f"on {date}")
+            if location:
+                detail_parts.append(f"at {location}")
+            detail_str = " ".join(detail_parts)
+            desc_str = f" {description}" if description else ""
+            intro = (
+                f"A visitor just tapped on the '{title}' {category} news card. "
+                f"Tell them about this {category} enthusiastically."
+            )
+            if detail_str:
+                intro += f" It is {detail_str}."
+            intro += f"{desc_str} Then invite them to ask follow-up questions."
+            print(f"Event focus received: {title} ({category})")
+            asyncio.create_task(session.generate_reply(user_input=intro))
+        except Exception as exc:
+            print(f"event_focus handler error: {exc}")
 
     async def _hearing_reflex():
         _udp({"command": "wake"})
@@ -347,7 +412,6 @@ async def entrypoint(ctx: agents.JobContext):
 
     print("Starting LiveKit session...")
     await session.start(room=ctx.room, agent=agent)
-    asyncio.create_task(_ensure_event_db(agent))
     asyncio.create_task(_monitor_presence_greetings(session, ctx))
 
     _session_live = True
@@ -378,11 +442,12 @@ def _start_voice_listener_once():
 if __name__ == "__main__":
     from livekit.agents import WorkerOptions, cli
 
-    _start_voice_listener_once()
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name="campus-greeting-agent",
             initialize_process_timeout=120,
+            num_idle_processes=1,
         )
     )

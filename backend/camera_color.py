@@ -97,6 +97,26 @@ def configure_picamera(
     return config
 
 
+def configure_wide_fov_camera(
+    picam2,
+    main_res: tuple[int, int],
+    *,
+    raw_sensor_res: tuple[int, int] = (3280, 2464),
+    buffer_count: int = 1,
+) -> object:
+    """Full-sensor crop for widest FOV (trackingeyes2 style). Needs cma=256 on Pi."""
+    main_size = (int(main_res[0]), int(main_res[1]))
+    raw_size = (int(raw_sensor_res[0]), int(raw_sensor_res[1]))
+    config = picam2.create_video_configuration(
+        main={"format": PICAMERA_MAIN_FORMAT, "size": main_size},
+        raw={"size": raw_size},
+        buffer_count=buffer_count,
+    )
+    picam2.configure(config)
+    picam2.set_controls({"ScalerCrop": (0, 0, raw_size[0], raw_size[1])})
+    return config
+
+
 def gray_world_white_balance_rgb(rgb: np.ndarray, strength: float) -> np.ndarray:
     strength = max(0.0, min(1.0, strength))
     if strength <= 0.0:
@@ -131,6 +151,65 @@ def _enhance_face_bgr(bgr: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     l = clahe.apply(l)
     return cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def detection_size_for_main(
+    main_res: tuple[int, int],
+    *,
+    max_width: int = 1280,
+) -> tuple[int, int]:
+    """Detect resolution with the same aspect ratio as the sensor (no vertical squash)."""
+    w, h = main_res
+    dw = int(max_width)
+    dh = int(round(dw * h / w))
+    if dh % 2:
+        dh += 1
+    return dw, dh
+
+
+def assert_detection_aspect_matches(
+    main_res: tuple[int, int],
+    detect_res: tuple[int, int],
+    *,
+    stream_res: tuple[int, int] | None = None,
+) -> None:
+    """Warn when detect/stream aspect differs from the sensor — YuNet boxes drift."""
+    main_aspect = main_res[0] / main_res[1]
+    detect_aspect = detect_res[0] / detect_res[1]
+    if abs(main_aspect - detect_aspect) > 0.02:
+        print(
+            f"Warning: detect_res {detect_res} aspect {detect_aspect:.3f} "
+            f"!= sensor {main_res} aspect {main_aspect:.3f}. "
+            "Face boxes and eye landmarks will be misaligned."
+        )
+    if stream_res is not None:
+        stream_aspect = stream_res[0] / stream_res[1]
+        if abs(main_aspect - stream_aspect) > 0.02:
+            print(
+                f"Warning: stream_res {stream_res} aspect {stream_aspect:.3f} "
+                f"!= sensor aspect {main_aspect:.3f}."
+            )
+
+
+def detect_faces_yunet_fast(
+    detector: Any,
+    oriented_frame: np.ndarray,
+    *,
+    input_size: tuple[int, int],
+    mode: str | None = None,
+) -> np.ndarray | None:
+    """Single-mode YuNet detect on an already-oriented frame (hot path)."""
+    use_mode = mode or DETECTION_BGR_MODE
+    if use_mode == "native_bgr":
+        detect_frame = oriented_frame
+    else:
+        detect_frame = rgb_to_bgr(oriented_frame)
+    w, h = input_size
+    detector.setInputSize((w, h))
+    result = detector.detect(detect_frame)
+    if result[1] is None:
+        return None
+    return result[1]
 
 
 def detect_faces_yunet(

@@ -7,79 +7,91 @@ from pathlib import Path
 
 from openai import OpenAI
 
+POSTER_CATEGORIES = ("events", "competitions", "posts")
+VALID_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
 
 def encode_image(image_path: Path) -> str:
     with open(image_path, "rb") as image_file:
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def index_posters(assets_dir: Path):
-    events_dir = assets_dir / "events"
-    if not events_dir.exists():
-        print(f"Events directory not found: {events_dir}")
-        return []
+def _vision_client() -> tuple[OpenAI, str] | tuple[None, None]:
+    if os.getenv("OPENROUTER_API_KEY"):
+        return (
+            OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=os.getenv("OPENROUTER_API_KEY"),
+            ),
+            "google/gemini-2.5-flash",
+        )
+    if os.getenv("GROQ_API_KEY"):
+        return (
+            OpenAI(
+                base_url="https://api.groq.com/openai/v1",
+                api_key=os.getenv("GROQ_API_KEY"),
+            ),
+            "llama-3.3-70b-versatile",
+        )
+    return None, None
 
-    api_key = os.getenv("OPENROUTER_API_KEY") or os.getenv("GROQ_API_KEY")
-    base_url = (
-        "https://openrouter.ai/api/v1"
-        if os.getenv("OPENROUTER_API_KEY")
-        else "https://api.groq.com/openai/v1"
-    )
-    model = (
-        "google/gemini-2.0-flash-001"
-        if os.getenv("OPENROUTER_API_KEY")
-        else "llama-3.3-70b-versatile"
-    )
 
-    if not api_key:
+def index_posters(assets_dir: Path) -> list[dict]:
+    """Scan events/competitions/posts posters and extract structured metadata."""
+    client, model = _vision_client()
+    if client is None:
         print("No OPENROUTER_API_KEY or GROQ_API_KEY — skipping poster indexing")
         return []
 
-    client = OpenAI(base_url=base_url, api_key=api_key)
-    events = []
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
+    extracted: list[dict] = []
+    print(f"Scanning posters in {assets_dir} ({', '.join(POSTER_CATEGORIES)})...")
 
-    print(f"Scanning for posters in {events_dir}...")
-
-    for file_path in events_dir.iterdir():
-        if file_path.suffix.lower() not in valid_extensions:
-            continue
-        print(f"   Processing {file_path.name}...")
-        try:
-            base64_image = encode_image(file_path)
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract event details from this poster. Return JSON with keys: "
-                                    "title, date, time, location, description. "
-                                    "If not an event poster, return null."
-                                ),
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}",
+    for category in POSTER_CATEGORIES:
+        cat_dir = assets_dir / category
+        cat_dir.mkdir(parents=True, exist_ok=True)
+        for file_path in sorted(cat_dir.iterdir()):
+            if file_path.suffix.lower() not in VALID_EXTENSIONS:
+                continue
+            print(f"   Processing {category}/{file_path.name}...")
+            try:
+                response = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Extract details from this poster/image. Return JSON with keys: "
+                                        "title, date, time, location, description. "
+                                        "Do your best to extract any relevant information."
+                                    ),
                                 },
-                            },
-                        ],
-                    }
-                ],
-                response_format={"type": "json_object"},
-            )
-            content = response.choices[0].message.content
-            if content:
+                                {
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": f"data:image/jpeg;base64,{encode_image(file_path)}",
+                                    },
+                                },
+                            ],
+                        }
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=1000,
+                )
+                content = response.choices[0].message.content
+                if not content:
+                    continue
                 event_data = json.loads(content)
-                if event_data:
-                    event_data["source_file"] = file_path.name
-                    events.append(event_data)
-                    print(f"   Extracted: {event_data.get('title', 'Unknown Event')}")
-        except Exception as e:
-            print(f"   Failed to process {file_path.name}: {e}")
+                if not event_data:
+                    continue
+                event_data["source_file"] = file_path.name
+                event_data["category"] = category
+                extracted.append(event_data)
+                print(f"   Extracted: {event_data.get('title', 'Unknown')} ({category})")
+            except Exception as exc:
+                print(f"   Failed to process {category}/{file_path.name}: {exc}")
 
-    return events
+    print(f"Poster indexing complete ({len(extracted)} item(s))")
+    return extracted

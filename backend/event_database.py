@@ -7,24 +7,24 @@ from pathlib import Path
 import chromadb
 from chromadb.utils import embedding_functions
 
-from event_indexer import index_posters
+from event_indexer import POSTER_CATEGORIES, VALID_EXTENSIONS, index_posters
 
 
 class EventDatabase:
-    def __init__(self, persist_directory):
+    def __init__(self, persist_directory: Path):
         self.client = chromadb.PersistentClient(path=str(persist_directory))
         self.collection = self.client.get_or_create_collection(
             name="campus_events",
             embedding_function=embedding_functions.DefaultEmbeddingFunction(),
         )
 
-    def add_events(self, events):
+    def add_events(self, events: list[dict]) -> None:
         if not events:
             return
 
-        ids = []
-        documents = []
-        metadatas = []
+        ids: list[str] = []
+        documents: list[str] = []
+        metadatas: list[dict[str, str]] = []
 
         for i, event in enumerate(events):
             text_desc = (
@@ -33,59 +33,64 @@ class EventDatabase:
             )
             ids.append(f"event_{i}_{event.get('source_file', 'unknown')}")
             documents.append(text_desc)
-            meta = {k: str(v) for k, v in event.items()}
-            metadatas.append(meta)
+            metadatas.append({k: str(v) for k, v in event.items()})
 
-        if ids:
-            self.collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-            print(f"Added {len(ids)} events to database")
+        self.collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+        print(f"Added {len(ids)} items to event database")
 
-    def query_events(self, query_text, n_results=3):
+    def query_events(self, query_text: str, n_results: int = 3) -> list[dict]:
         results = self.collection.query(query_texts=[query_text], n_results=n_results)
-        formatted_events = []
-        if results["metadatas"] and len(results["metadatas"]) > 0:
-            for meta in results["metadatas"][0]:
-                formatted_events.append(meta)
-        return formatted_events
+        formatted: list[dict] = []
+        if results["metadatas"] and results["metadatas"][0]:
+            formatted.extend(results["metadatas"][0])
+        return formatted
 
     def has_data(self) -> bool:
         return self.collection.count() > 0
 
 
-def _compute_events_manifest(events_dir: Path) -> dict:
-    valid_extensions = {".jpg", ".jpeg", ".png", ".webp"}
-    manifest = {}
-    if events_dir.exists():
-        for f in sorted(events_dir.iterdir()):
-            if f.suffix.lower() in valid_extensions:
-                manifest[f.name] = hashlib.md5(f.read_bytes()).hexdigest()
+def _compute_events_manifest(assets_dir: Path) -> dict[str, str]:
+    manifest: dict[str, str] = {}
+    for category in POSTER_CATEGORIES:
+        cat_dir = assets_dir / category
+        if not cat_dir.exists():
+            continue
+        for file_path in sorted(cat_dir.iterdir()):
+            if file_path.suffix.lower() in VALID_EXTENSIONS:
+                manifest[f"{category}/{file_path.name}"] = hashlib.md5(
+                    file_path.read_bytes()
+                ).hexdigest()
     return manifest
 
 
-def build_event_database(assets_dir: Path):
+def build_event_database(assets_dir: Path) -> EventDatabase:
     db_path = Path(__file__).parent / "event_db"
     db_path.mkdir(exist_ok=True)
     manifest_path = db_path / "event_manifest.json"
+    extracted_path = db_path / "extracted_events.json"
 
     db = EventDatabase(db_path)
-    events_dir = assets_dir / "events"
-    current_manifest = _compute_events_manifest(events_dir)
+    current_manifest = _compute_events_manifest(assets_dir)
 
-    saved_manifest = {}
+    saved_manifest: dict[str, str] = {}
     if manifest_path.exists():
         try:
-            saved_manifest = json.loads(manifest_path.read_text())
+            saved_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
             saved_manifest = {}
 
     if current_manifest == saved_manifest and db.has_data():
-        print(f"Event DB up-to-date ({len(current_manifest)} posters, skipping re-index)")
+        print(
+            f"Event DB up-to-date ({len(current_manifest)} poster(s), skipping re-index)"
+        )
         return db
 
     changed = set(current_manifest) ^ set(saved_manifest)
-    print(f"Events changed ({len(changed)} file(s) differ). Re-indexing...")
+    print(f"Posters changed ({len(changed)} file(s) differ). Re-indexing...")
     events = index_posters(assets_dir)
     db.add_events(events)
-    manifest_path.write_text(json.dumps(current_manifest, indent=2))
-    print(f"Manifest saved ({len(current_manifest)} files tracked)")
+
+    extracted_path.write_text(json.dumps(events, indent=2), encoding="utf-8")
+    manifest_path.write_text(json.dumps(current_manifest, indent=2), encoding="utf-8")
+    print(f"Manifest saved ({len(current_manifest)} file(s) tracked)")
     return db

@@ -1,0 +1,15 @@
+{
+  "floor": 1,
+  "nodes": [
+    {"id": "main_entrance", "name": "Main Entrance", "floor": 1},
+    {"id": "ds_lab", "name": "DS Lab", "floor": 1, "room": "Lab 03"},
+    {"id": "dean_office", "name": "Dean Office", "floor": 1},
+    {"id": "library", "name": "Library", "floor": 1}
+  ],
+  "edges": [
+    {"from": "main_entrance", "to": "library"},
+    {"from": "main_entrance", "to": "dean_office"},
+    {"from": "library", "to": "ds_lab"},
+    {"from": "dean_office", "to": "ds_lab"}
+  ]
+}

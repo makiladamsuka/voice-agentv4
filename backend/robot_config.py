@@ -13,7 +13,13 @@ _CONFIG_PATH: Path | None = None
 _CACHED: RobotConfig | None = None
 
 # Fields safe to change at runtime (no camera/display restart).
-RESTART_REQUIRED_PREFIXES = ("display.", "camera.main_res", "camera.detect_res", "stream.port", "stream.host")
+# Entire camera.* block is locked — wide-FOV picamera pipeline; change only for mount/hardware.
+RESTART_REQUIRED_PREFIXES = (
+    "display.",
+    "camera.",
+    "stream.port",
+    "stream.host",
+)
 
 TUNING_FIELDS: list[dict[str, Any]] = [
     {"path": "face_tracking.face_track_smooth_alpha", "label": "Face smooth alpha", "min": 0.05, "max": 0.35, "step": 0.01},
@@ -67,20 +73,22 @@ class CameraConfig:
     body_detect_stride: int = 2
     body_track_servo_alpha: float = 0.30
     body_aim_y_ratio: float = 0.22
-    use_preview_pipeline: bool = True
-    main_res: list[int] = field(default_factory=lambda: [1640, 1232])
+    wide_fov: bool = True
+    use_preview_pipeline: bool = False
+    main_res: list[int] = field(default_factory=lambda: [1920, 1080])
     detect_res: list[int] = field(default_factory=lambda: [1280, 720])
-    stream_res: list[int] = field(default_factory=lambda: [1280, 960])
+    stream_res: list[int] = field(default_factory=lambda: [640, 360])
+    raw_sensor_res: list[int] = field(default_factory=lambda: [3280, 2464])
     sharpness: float = 1.0
     noise_reduction: str = "high"
-    confidence_threshold: float = 0.32
+    confidence_threshold: float = 0.6
     nms_threshold: float = 0.3
-    rotate_180: bool = True
+    rotate_180: bool = False
     stream_swap_rb: bool = True
     awb_mode: str = "auto"
     colour_gains: list[float] | None = None
-    stream_white_balance: bool = True
-    stream_wb_strength: float = 0.85
+    stream_white_balance: bool = False
+    stream_wb_strength: float = 0.55
 
 
 @dataclass
@@ -381,6 +389,24 @@ class TofConfig:
 
 
 @dataclass
+class SurroundingsEmotionConfig:
+    no_face_grace_sec: float = 0.9
+    no_person_hold_min_sec: float = 2.8
+    no_person_hold_max_sec: float = 5.2
+    person_hold_min_sec: float = 1.1
+    person_hold_max_sec: float = 2.8
+    direction_trigger_norm_x: float = 0.22
+    direction_hold_min_sec: float = 0.6
+    direction_hold_max_sec: float = 1.2
+    direction_cooldown_sec: float = 0.9
+    close_face_enter_ratio: float = 0.05
+    far_face_area_ratio: float = 0.018
+    near_exit_ratio: float = 0.041
+    far_exit_ratio: float = 0.0225
+    emotion_history_len: int = 3
+
+
+@dataclass
 class RobotConfig:
     display: DisplayConfig = field(default_factory=DisplayConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
@@ -393,6 +419,9 @@ class RobotConfig:
     servo: ServoConfig = field(default_factory=ServoConfig)
     base: BaseConfig = field(default_factory=BaseConfig)
     tof: TofConfig = field(default_factory=TofConfig)
+    surroundings_emotion: SurroundingsEmotionConfig = field(
+        default_factory=SurroundingsEmotionConfig
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

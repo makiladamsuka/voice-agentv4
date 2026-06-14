@@ -50,7 +50,7 @@ class ImageServer:
                 <html><head><title>Voice Agent Assets</title></head>
                 <body style="font-family:sans-serif;padding:20px">
                 <h1>Voice Agent Media Server</h1>
-                <p>Serving event posters and maps for the frontend at port {image_server.port}.</p>
+                <p>Serving events, competitions, posts, and maps for the frontend at port {image_server.port}.</p>
                 <p>Robot debug dashboard: <code>http://&lt;pi-ip&gt;:8090/debug</code></p>
                 </body></html>
                 """

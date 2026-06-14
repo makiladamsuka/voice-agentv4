@@ -38,8 +38,9 @@ from camera_color import (
     DETECTION_BGR_MODE,
     apply_camera_controls,
     configure_picamera,
+    configure_wide_fov_camera,
     detect_faces_yunet,
-    encode_stream_jpeg_rgb,
+    detect_faces_yunet_fast,
     frame_to_rgb,
     log_color_pipeline_verification,
     probe_yunet_bgr_mode,
@@ -125,9 +126,10 @@ def _map_coords_to_stream_preview(
     detect_res: tuple[int, int],
     stream_res: tuple[int, int],
     rotate_180: bool,
+    wide_fov: bool = False,
 ) -> tuple[int, int, int, int, int, int, int, int]:
     w, h = detect_res
-    if rotate_180:
+    if not wide_fov and rotate_180:
         fx = w - fx - fw
         fy = h - fy - fh
         re_x, re_y = w - re_x, h - re_y
@@ -153,6 +155,7 @@ def _draw_faces_on_stream(
     detect_res: tuple[int, int],
     stream_res: tuple[int, int],
     rotate_180: bool,
+    wide_fov: bool = False,
 ) -> None:
     for face in faces:
         fx, fy, fw, fh = face[0:4]
@@ -163,6 +166,7 @@ def _draw_faces_on_stream(
             detect_res=detect_res,
             stream_res=stream_res,
             rotate_180=rotate_180,
+            wide_fov=wide_fov,
         )
         cv2.rectangle(stream_frame, (fx_s, fy_s), (fx_s + fw_s, fy_s + fh_s), (0, 255, 0), 2)
         cv2.circle(stream_frame, (re_x_s, re_y_s), 4, (255, 0, 0), -1)
@@ -184,7 +188,9 @@ def _vision_worker(
     stream_res = tuple(cfg.camera.stream_res)
     rotate_180 = bool(cfg.camera.rotate_180)
     stream_swap_rb = bool(cfg.camera.stream_swap_rb)
-    use_preview = bool(getattr(cfg.camera, "use_preview_pipeline", True))
+    wide_fov = bool(getattr(cfg.camera, "wide_fov", False))
+    use_preview = bool(getattr(cfg.camera, "use_preview_pipeline", True)) and not wide_fov
+    raw_sensor_res = tuple(getattr(cfg.camera, "raw_sensor_res", [3280, 2464]))
     interval = 1.0 / max(1.0, float(cfg.stream.vision_fps))
 
     frame_count = 0
@@ -195,25 +201,38 @@ def _vision_worker(
         loop_start = time.perf_counter()
         try:
             large_frame = picam2.capture_array()
-            rgb_frame = frame_to_rgb(
-                large_frame,
-                legacy_swap_rb=stream_swap_rb and not use_preview,
-            )
-            frame_raw = cv2.resize(rgb_frame, detect_res, interpolation=cv2.INTER_AREA)
-
-            if stream_res == main_res:
-                stream_frame = rgb_frame.copy()
+            if wide_fov:
+                frame_raw = cv2.resize(large_frame, detect_res, interpolation=cv2.INTER_AREA)
+                if rotate_180:
+                    frame_raw = cv2.rotate(frame_raw, cv2.ROTATE_180)
+                stream_frame = cv2.resize(frame_raw, stream_res, interpolation=cv2.INTER_AREA)
+                if stream_swap_rb:
+                    stream_frame = cv2.cvtColor(stream_frame, cv2.COLOR_BGR2RGB)
+                faces = detect_faces_yunet_fast(
+                    detector,
+                    frame_raw,
+                    input_size=detect_res,
+                )
+                mode = DETECTION_BGR_MODE
             else:
-                stream_frame = cv2.resize(rgb_frame, stream_res, interpolation=cv2.INTER_AREA)
+                rgb_frame = frame_to_rgb(
+                    large_frame,
+                    legacy_swap_rb=stream_swap_rb and not use_preview,
+                )
+                frame_raw = cv2.resize(rgb_frame, detect_res, interpolation=cv2.INTER_AREA)
+                if stream_res == main_res:
+                    stream_frame = rgb_frame.copy()
+                else:
+                    stream_frame = cv2.resize(rgb_frame, stream_res, interpolation=cv2.INTER_AREA)
+                faces, mode = detect_faces_yunet(
+                    detector,
+                    frame_raw,
+                    input_size=detect_res,
+                    rotate_180=rotate_180,
+                )
             if flip_stream:
                 stream_frame = cv2.rotate(stream_frame, cv2.ROTATE_180)
 
-            faces, mode = detect_faces_yunet(
-                detector,
-                frame_raw,
-                input_size=detect_res,
-                rotate_180=rotate_180,
-            )
             face_count = 0 if faces is None else len(faces)
             if face_count:
                 _draw_faces_on_stream(
@@ -222,6 +241,7 @@ def _vision_worker(
                     detect_res=detect_res,
                     stream_res=stream_res,
                     rotate_180=rotate_180,
+                    wide_fov=wide_fov,
                 )
 
             with _frame_lock:
@@ -378,8 +398,15 @@ def main() -> int:
 
     print("Initializing Picamera2…")
     picam2 = Picamera2()
-    use_preview = bool(getattr(cfg.camera, "use_preview_pipeline", True))
-    configure_picamera(picam2, main_res, use_preview_pipeline=use_preview)
+    wide_fov = bool(getattr(cfg.camera, "wide_fov", False))
+    use_preview = bool(getattr(cfg.camera, "use_preview_pipeline", True)) and not wide_fov
+    if wide_fov:
+        raw_sensor_res = tuple(getattr(cfg.camera, "raw_sensor_res", [3280, 2464]))
+        configure_wide_fov_camera(picam2, main_res, raw_sensor_res=raw_sensor_res)
+        pipeline = f"wide-FOV video/RGB888 raw {raw_sensor_res[0]}x{raw_sensor_res[1]}"
+    else:
+        configure_picamera(picam2, main_res, use_preview_pipeline=use_preview)
+        pipeline = "preview/sRGB (rpicam-hello)" if use_preview else "video/RGB888"
     picam2.start()
     apply_camera_controls(
         picam2,
@@ -390,7 +417,7 @@ def main() -> int:
     )
     with _state_lock:
         _state["camera_ok"] = True
-    pipeline = "preview/sRGB (rpicam-hello)" if use_preview else "video/RGB888"
+        _state["wide_fov"] = wide_fov
     print(f"Camera started ({pipeline}): main {main_res[0]}x{main_res[1]}, detect {detect_res[0]}x{detect_res[1]}, stream {stream_res[0]}x{stream_res[1]}")
 
     print("Loading YuNet face detector…")
@@ -408,14 +435,28 @@ def main() -> int:
         _state["detector_ok"] = True
     print(f"YuNet loaded from {model_path.name}")
 
-    capture = cv2.resize(
-        frame_to_rgb(picam2.capture_array(), legacy_swap_rb=cfg.camera.stream_swap_rb and not use_preview),
-        detect_res,
-    )
-    color_stats = verify_color_pipeline(capture)
-    mode, probe_count = probe_yunet_bgr_mode(
-        detector, capture, input_size=detect_res, rotate_180=cfg.camera.rotate_180
-    )
+    if wide_fov:
+        capture = cv2.resize(picam2.capture_array(), detect_res, interpolation=cv2.INTER_AREA)
+        if cfg.camera.rotate_180:
+            capture = cv2.rotate(capture, cv2.ROTATE_180)
+        color_stats = verify_color_pipeline(
+            cv2.cvtColor(capture, cv2.COLOR_BGR2RGB) if cfg.camera.stream_swap_rb else capture
+        )
+        mode, probe_count = probe_yunet_bgr_mode(
+            detector, capture, input_size=detect_res, rotate_180=False
+        )
+    else:
+        capture = cv2.resize(
+            frame_to_rgb(
+                picam2.capture_array(),
+                legacy_swap_rb=cfg.camera.stream_swap_rb and not use_preview,
+            ),
+            detect_res,
+        )
+        color_stats = verify_color_pipeline(capture)
+        mode, probe_count = probe_yunet_bgr_mode(
+            detector, capture, input_size=detect_res, rotate_180=cfg.camera.rotate_180
+        )
     log_color_pipeline_verification(color_stats, detection_mode=mode, face_probe_count=probe_count)
     print(f"Detection BGR mode: {mode} (global={DETECTION_BGR_MODE})")
 
