@@ -23,6 +23,7 @@ from _bootstrap import BACKEND_ROOT
 
 from animation_player import AnimationPlayer
 from arduino_servo import ArduinoServoLink
+from esp32_serial import connect_esp32, prepare_esp32_for_live_control
 from botango_loader import (
     DEFAULT_ARM_NEUTRALS,
     _parse_setup,
@@ -213,10 +214,11 @@ def main() -> int:
         print("Interactive mode needs a terminal, or use --play N")
         return 1
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
-    if not link.connect():
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
+    if link is None:
         print("Failed to connect. Stop start_robot.py and check USB / firmware READY.")
         return 1
+    prepare_esp32_for_live_control(link)
 
     arm_home = load_arm_neutrals()
     last_idx = 0

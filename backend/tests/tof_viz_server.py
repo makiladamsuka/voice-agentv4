@@ -22,6 +22,7 @@ import _bootstrap  # noqa: F401
 from _bootstrap import BACKEND_ROOT
 
 from arduino_servo import ArduinoServoLink
+from esp32_serial import connect_esp32
 from robot_config import load_config
 from tof_presence import TofSnapshot, sanitize_tof_snapshot
 
@@ -125,8 +126,8 @@ def main() -> int:
     cfg = load_config()
     min_valid_mm = int(cfg.tof.min_valid_mm)
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
-    if not link.connect():
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
+    if link is None:
         print("Could not connect to ESP32. Check USB and stop other serial users.")
         return 1
 

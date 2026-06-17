@@ -86,6 +86,27 @@
     }
     .badge.on { background: #1e3a2f; color: var(--ok); }
     .badge.off { background: #3a1e1e; color: #ff8a8a; }
+    .temp-val {
+      font-size: 28px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      margin-top: 4px;
+    }
+    .temp-val.ok { color: var(--ok); }
+    .temp-val.warn { color: var(--warn); }
+    .temp-val.hot { color: #ff6b6b; }
+    .temp-bar {
+      height: 8px;
+      background: var(--bg);
+      border-radius: 4px;
+      margin-top: 8px;
+      overflow: hidden;
+    }
+    .temp-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.2s, background 0.2s;
+    }
     .trace {
       margin-top: 8px;
       padding: 8px;
@@ -193,12 +214,29 @@
       margin-top: 4px;
     }
     .tof-card .mm.invalid { color: var(--muted); font-size: 14px; }
+    #tof-status-line {
+      font-size: 12px;
+      margin-bottom: 10px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      background: var(--bg);
+      color: var(--muted);
+    }
+    #tof-status-line.live { color: var(--ok); background: #1a2e22; }
+    #tof-status-line.clear { color: var(--muted); }
+    #tof-status-line.waiting { color: var(--warn); background: #2e2a1a; }
+    #tof-status-line.stale,
+    #tof-status-line.no_firmware,
+    #tof-status-line.disabled { color: #ff8a8a; background: #2e1a1a; }
   </style>
 </head>
 <body>
   <header>
     <h1>Robot Debug Dashboard</h1>
-    <div id="status-bar">Connecting...</div>
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+      <div id="cpu-temp-header" class="badge" title="CPU temperature">CPU —°C</div>
+      <div id="status-bar">Connecting...</div>
+    </div>
   </header>
 
   <div class="grid">
@@ -207,6 +245,11 @@
       <div class="camera-wrap">
         <img src="/stream" alt="Camera stream">
       </div>
+    </section>
+
+    <section class="panel">
+      <h2>System</h2>
+      <div class="panel-body" id="system-panel">—</div>
     </section>
 
     <section class="panel">
@@ -232,6 +275,7 @@
     <section class="panel panel-wide">
       <h2>ToF Sensors</h2>
       <div class="panel-body">
+        <div id="tof-status-line">Waiting for ToF data…</div>
         <div class="tof-grid">
           <canvas id="tof-radar" width="640" height="420"></canvas>
           <div>
@@ -414,11 +458,47 @@
       }
     }
 
+    const TOF_STATUS_TEXT = {
+      live: "Live — receiving distance readings",
+      clear: "Live — no obstacle in range (all beams clear)",
+      waiting: "Waiting for first ToF poll (VL53 init can take ~10s on boot)",
+      stale: "Stale — no fresh ToF data from ESP32 (check USB / serial)",
+      no_firmware: "ESP32 firmware missing ToF — flash firmware/head_servo/head_servo.ino",
+      disabled: "ToF disabled in config.yaml",
+    };
+
+    function renderTofStatus(tof) {
+      const el = document.getElementById("tof-status-line");
+      if (!el) return;
+      if (!tof) {
+        el.className = "disabled";
+        el.textContent = "ToF state unavailable (is robot running?)";
+        return;
+      }
+      const status = tof.status || (tof.enabled ? "waiting" : "disabled");
+      el.className = status;
+      const age = tof.age_sec;
+      const ageBit = age != null ? ` · last ${age.toFixed(1)}s ago` : "";
+      const hzBit = tof.poll_hz ? ` · ${tof.poll_hz} Hz` : "";
+      el.textContent = (TOF_STATUS_TEXT[status] || status) + ageBit + hzBit;
+    }
+
     function renderTofPanel(tof) {
+      renderTofStatus(tof);
       const data = tofRadarData(tof);
       if (!data) {
+        for (const key of ["left", "center", "right"]) {
+          const card = document.getElementById(`tof-card-${key}`);
+          const mmEl = document.getElementById(`tof-mm-${key}`);
+          if (card) card.classList.remove("valid");
+          if (mmEl) {
+            mmEl.classList.add("invalid");
+            mmEl.textContent = "—";
+          }
+        }
+        tofCtx.clearRect(0, 0, tofCanvas.width, tofCanvas.height);
         document.getElementById("tof-meta-panel").innerHTML =
-          "<dt>ToF</dt><dd>disabled</dd>";
+          "<dt>ToF</dt><dd>unavailable</dd>";
         return;
       }
       updateTofCards(data);
@@ -427,6 +507,8 @@
       const offset = tof.target_pan_offset_deg ?? tof.bearing_deg;
       document.getElementById("tof-meta-panel").innerHTML = `
         <dt>Enabled</dt><dd>${badge(tof.enabled)}</dd>
+        <dt>Firmware</dt><dd>${badge(tof.firmware_ok, "ok", "missing")}</dd>
+        <dt>Status</dt><dd>${tof.status ?? "—"}</dd>
         <dt>Presence L/C/R</dt><dd>${badge(pres.left)} ${badge(pres.center)} ${badge(pres.right)}</dd>
         <dt>Pan target</dt><dd>${offset == null ? "—" : offset + "°"}</dd>
         <dt>Phase</dt><dd>${tof.approach_phase ?? "idle"}</dd>
@@ -453,7 +535,38 @@
       </div>`;
     }
 
+    function cpuTempClass(c) {
+      if (c == null || Number.isNaN(c)) return "";
+      if (c >= 80) return "hot";
+      if (c >= 70) return "warn";
+      return "ok";
+    }
+
+    function renderSystemPanel(sys) {
+      const c = sys?.cpu_temp_c;
+      const cls = cpuTempClass(c);
+      const label = c != null ? `${c.toFixed(1)}°C` : "—";
+      const pct = c != null ? Math.min(100, Math.max(0, ((c - 40) / 45) * 100)) : 0;
+      const fillColor = cls === "hot" ? "#ff6b6b" : cls === "warn" ? "#f5a623" : "#3dd68c";
+      const hint = c == null ? "unavailable"
+        : c >= 80 ? "throttling risk — improve cooling"
+        : c >= 70 ? "warm — watch under load"
+        : "normal";
+      document.getElementById("system-panel").innerHTML = `
+        <div class="temp-val ${cls}">${label}</div>
+        <div style="color:var(--muted);font-size:11px;margin-top:2px">SoC CPU temperature · ${hint}</div>
+        <div class="temp-bar"><div class="temp-bar-fill" style="width:${pct}%;background:${fillColor}"></div></div>`;
+      const hdr = document.getElementById("cpu-temp-header");
+      if (hdr) {
+        hdr.textContent = c != null ? `CPU ${c.toFixed(1)}°C` : "CPU —°C";
+        hdr.className = `badge ${cls === "hot" ? "off" : cls === "warn" ? "" : "on"}`;
+        if (cls === "warn") hdr.style.background = "#3a2e1e";
+        else hdr.style.background = "";
+      }
+    }
+
     function renderState(s) {
+      renderSystemPanel(s.system);
       document.getElementById("emotion-panel").innerHTML = `
         <dl>
           <dt>Current</dt><dd><strong>${s.emotion.current}</strong></dd>
@@ -492,6 +605,7 @@
       document.getElementById("servo-panel").innerHTML = `
         <dl>
           <dt>Enabled</dt><dd>${badge(s.servo.enabled)}</dd>
+          <dt>ESP32 serial</dt><dd>${badge(s.servo.serial_connected, "connected", "disconnected")}</dd>
           <dt>Pan</dt><dd>${s.servo.pan}° (target ${s.servo.target_pan}°)</dd>
           <dt>Tilt</dt><dd>${s.servo.tilt}° (target ${s.servo.target_tilt}°)</dd>
         </dl>`;
@@ -566,7 +680,9 @@
         const data = await res.json();
         renderState(data);
         const ts = new Date(data.timestamp * 1000).toLocaleTimeString();
-        statusBar.textContent = `Live · updated ${ts}`;
+        const temp = data.system?.cpu_temp_c;
+        const tempBit = temp != null ? ` · ${temp.toFixed(1)}°C` : "";
+        statusBar.textContent = `Live${tempBit} · updated ${ts}`;
         statusBar.classList.remove("error");
       } catch (err) {
         statusBar.textContent = `Poll error: ${err.message}`;

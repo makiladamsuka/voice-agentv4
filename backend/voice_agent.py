@@ -43,7 +43,17 @@ def _udp(payload: dict):
 
 def _voice_udp_listener():
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(("127.0.0.1", _VOICE_LISTENER_PORT))
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", _VOICE_LISTENER_PORT))
+    except OSError as e:
+        if e.errno in (98, 48):  # Linux / macOS "address already in use"
+            print(
+                f"Voice presence listener: UDP {_VOICE_LISTENER_PORT} already in use "
+                "(stale voice_agent? stop old start_robot.py first)"
+            )
+            return
+        raise
     print(f"Voice presence listener on UDP {_VOICE_LISTENER_PORT}")
     while True:
         try:

@@ -16,6 +16,7 @@ import time
 import _bootstrap  # noqa: F401
 
 from arduino_servo import ArduinoServoLink
+from esp32_serial import connect_esp32
 from robot_config import load_config
 from tof_presence import (
     TofPresenceTracker,
@@ -54,8 +55,8 @@ def main() -> int:
     )
     min_valid_mm = int(t.min_valid_mm)
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
-    if not link.connect():
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
+    if link is None:
         print("Could not connect to ESP32.")
         return 1
 

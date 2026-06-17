@@ -25,6 +25,11 @@ import time
 import _bootstrap  # noqa: F401
 
 from arduino_servo import ArduinoServoLink
+from esp32_serial import (
+    ESP32_SERIAL_SEND_HZ,
+    connect_esp32,
+    prepare_esp32_for_live_control,
+)
 from elastic_head_motion import (
     HeadMotionParams,
     clamp,
@@ -34,38 +39,39 @@ from elastic_head_motion import (
 from robot_config import load_config
 
 LOOP_HZ = 100.0
-KEY_TIMEOUT = 0.8
+SERIAL_SEND_HZ = ESP32_SERIAL_SEND_HZ
+KEY_TIMEOUT = 0.35
 DEBUG_HZ = 8.0
 BASE_POLL_HZ = 1.5
 DEFAULT_HOLD_SEC = 3.0
 CONTROL_KEYS = frozenset("wasd")
 
-# Head elastic — defaults from elastic_head_motion; override vel_blend here if needed
-HEAD_VEL_BLEND = 0.28
+# Head elastic — smoother and less aggressive response.
+HEAD_VEL_BLEND = 0.30
 PAN_MOTION = HeadMotionParams(
-    max_vel_pos=22.0,
-    max_vel_neg=22.0,
-    accel=55.0,
-    decel=85.0,
+    max_vel_pos=40.0,
+    max_vel_neg=40.0,
+    accel=130.0,
+    decel=180.0,
     vel_blend=HEAD_VEL_BLEND,
 )
 TILT_MOTION = HeadMotionParams(
-    max_vel_pos=18.0,
+    max_vel_pos=24.0,
     max_vel_neg=10.0,
-    accel=45.0,
-    decel=70.0,
+    accel=85.0,
+    decel=170.0,
     vel_blend=HEAD_VEL_BLEND,
     decel_boost_dir=-1.0,
-    decel_boost_mult=1.85,
+    decel_boost_mult=2.20,
 )
 
 # Base tap (M/N = one small encoder move per press)
-BASE_TAP_DEG = 3.0
+BASE_TAP_DEG = 1.5
 BASE_TAP_DEBOUNCE_SEC = 0.22
 
 # Spring return to center (home / C key)
-SPRING_K = 9.0
-SPRING_DAMP = 6.5
+SPRING_K = 7.8
+SPRING_DAMP = 5.8
 HOME_SETTLE_VEL = 0.35
 HOME_SETTLE_POS = 0.4
 BASE_HOME_DEG = 0.0
@@ -191,9 +197,29 @@ def _queue_base_tap(
 def _run_base_tap(link: ArduinoServoLink, queue: list[float]) -> bool:
     if not queue:
         return False
+    st = link.query_status()
+    if st is not None and st.busy:
+        return False
     deg = queue.pop(0)
-    link.write_base_relative(deg, wait=True)
-    return True
+    ok = link.write_base_relative(deg, wait=True)
+    return ok
+
+
+def _maybe_send_angles(
+    link: ArduinoServoLink,
+    pan: float,
+    tilt: float,
+    *,
+    last_send_ts: float,
+    send_interval: float,
+    force: bool = False,
+) -> float:
+    """Throttle USB serial — only latest pose, avoids ESP32 command backlog."""
+    now = time.time()
+    if force or (now - last_send_ts) >= send_interval:
+        link.write_angles(pan, tilt, force=force)
+        return now
+    return last_send_ts
 
 
 def run_interactive(
@@ -220,10 +246,15 @@ def run_interactive(
     key_last_seen: dict[str, float] = {}
     last_debug_ts = 0.0
     last_base_poll_ts = 0.0
+    last_serial_send_ts = 0.0
+    send_interval = 1.0 / max(5.0, SERIAL_SEND_HZ)
     running = True
 
-    link.write_angles(pan, tilt, force=True)
+    link.flush_pending_commands()
+    link.write_base_stop()
     link.set_tof_stream(False)
+    link.write_angles(pan, tilt, force=True)
+    last_serial_send_ts = time.time()
 
     print("--- Elastic head + base control (ESP32) ---")
     print("  W/S = tilt up/down (inverted)   A/D = pan left/right")
@@ -243,6 +274,7 @@ def run_interactive(
     old_settings = termios.tcgetattr(sys.stdin)
     try:
         tty.setcbreak(sys.stdin.fileno())
+        _drain_keys()
         try:
             while running:
                 key_now = time.time()
@@ -326,7 +358,13 @@ def run_interactive(
                         params=TILT_MOTION,
                     )
 
-                link.write_angles(pan, tilt)
+                last_serial_send_ts = _maybe_send_angles(
+                    link,
+                    pan,
+                    tilt,
+                    last_send_ts=last_serial_send_ts,
+                    send_interval=send_interval,
+                )
 
                 if base_tap_queue and not base_tap_busy:
                     base_tap_busy = True
@@ -438,8 +476,9 @@ def main() -> int:
     args = parser.parse_args()
     loop_delay = max(0.005, args.loop_delay)
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
-    if not link.connect():
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
+    print("Tip: stop start_robot.py first — only one program can use /dev/ttyUSB0.")
+    if link is None:
         print("Failed to connect. Check USB and head_servo firmware (READY).")
         return 1
 
@@ -449,6 +488,8 @@ def main() -> int:
         apply_config_cpd_to_nano(link)
     except Exception as e:
         print(f"Note: base CPD not applied ({e})")
+
+    prepare_esp32_for_live_control(link)
 
     pan_min, pan_max, tilt_min, tilt_max, pan_center, tilt_center = _limits()
     base_start = _read_base_deg(link)

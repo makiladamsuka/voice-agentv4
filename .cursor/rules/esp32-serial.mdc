@@ -1,0 +1,36 @@
+---
+description: ESP32 USB serial connect policy — do not change without explicit user approval
+globs: backend/arduino_servo.py,backend/esp32_serial.py,backend/servo_driver.py,backend/robot_eyes.py,backend/tests/test_head_servos.py,backend/tests/test_base_motor.py,backend/tests/robottest.py,backend/start_robot.py
+alwaysApply: false
+---
+
+# ESP32 serial policy (locked)
+
+All code that opens `/dev/ttyUSB0` (or ESP32 serial) must use `esp32_serial.py` — not ad-hoc link flags.
+
+## Required pattern
+
+1. **Configure before connect**: `configure_esp32_link(link)` or `connect_esp32()`
+2. **Never** set `_skip_tof_probe_at_connect`, `_allow_dtr_reset`, `_port_wait_sec` inline elsewhere
+3. **Prepare before live control**: `prepare_esp32_for_live_control(link)` after connect + CPD
+4. **Throttle head P/T serial** to `ESP32_SERIAL_SEND_HZ` (30 Hz) — never send at 100 Hz
+5. **One program per port** — `start_robot.py` and `test_head_servos.py` cannot run together
+6. **Robot runtime**: ESP32 connects in background; camera/vision start first (`robot_eyes.py`)
+7. **No DTR reset** on reconnect (`ESP32_ALLOW_DTR_RESET = False`)
+8. **Reconnect** on serial loss via `_schedule_servo_reconnect` in `robot_eyes.py`
+
+## Constants (in `esp32_serial.py`)
+
+| Constant | Value | Why |
+|----------|-------|-----|
+| `ESP32_SERIAL_SEND_HZ` | 30 | Prevents command backlog / delayed servo response |
+| `ESP32_PORT_WAIT_SEC` | 45 | USB hotplug tolerance |
+| `ESP32_SKIP_TOF_PROBE_AT_CONNECT` | True | Fast ready; ToF polls in worker |
+| `ESP32_ALLOW_DTR_RESET` | False | Avoid reboot + stale queued commands |
+
+## Do not change without user approval
+
+- Do not revert to blocking ESP32 connect before camera
+- Do not increase serial send rate above 30 Hz for head servos
+- Do not remove `flush_pending_commands()` before interactive/tracking control
+- Do not re-enable USB webcam paths (CSI Picamera2 only)

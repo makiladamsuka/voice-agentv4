@@ -7,6 +7,7 @@ Optional: ESP32 pan/tilt face following via USB serial (PCA9685).
 """
 
 import signal
+import subprocess
 import time
 import math
 import random
@@ -28,6 +29,7 @@ from robot_config import (
     patch_config,
     save_config,
 )
+from esp32_serial import prepare_esp32_for_live_control, serial_send_interval_sec
 from servo_driver import create_servo_driver
 from elastic_head_motion import (
     HeadMotionParams,
@@ -50,6 +52,7 @@ from botango_loader import (
     servo_stop_pose,
 )
 from person_detector import PersonDetector
+import camera_color
 from camera_color import (
     apply_camera_controls,
     assert_detection_aspect_matches,
@@ -253,8 +256,20 @@ WANDER_BASE_FOLLOW_MIN_PAN_DEG = _ft.wander_base_follow_min_pan_deg
 WANDER_BASE_FOLLOW_MIN_DRIFT_VEL = _ft.wander_base_follow_min_drift_vel
 WANDER_BASE_FOLLOW_COOLDOWN_SEC = _ft.wander_base_follow_cooldown_sec
 WANDER_BASE_FOLLOW_EVAL_SEC = _ft.wander_base_follow_eval_sec
+FACE_BASE_ALIVE_ENABLED = _ft.face_base_alive_enabled
+FACE_BASE_ALIVE_DEG = _ft.face_base_alive_deg
+FACE_BASE_ALIVE_MAX_DEG = _ft.face_base_alive_max_deg
+FACE_BASE_ALIVE_MIN_SEC = _ft.face_base_alive_min_sec
+FACE_BASE_ALIVE_MAX_SEC = _ft.face_base_alive_max_sec
+FACE_BASE_EDGE_NORM = _ft.face_base_edge_norm
+FACE_BASE_EDGE_NUDGE_DEG = _ft.face_base_edge_nudge_deg
+FACE_BASE_EDGE_PAN_EDGE_DEG = _ft.face_base_edge_pan_edge_deg
+FACE_BASE_COOLDOWN_SEC = _ft.face_base_cooldown_sec
+FACE_BASE_HEAD_COMP_ALPHA = _ft.face_base_head_comp_alpha
 BASE_HOME_DEG = 0.0
 BASE_MAX_DEG_FROM_ZERO = _base.max_deg_from_zero
+BASE_MAX_NUDGE_DEG = _base.max_nudge_deg
+BASE_ERROR_BACKOFF_SEC = _base.error_backoff_sec
 SAD_RETURN_SEC = _ft.sad_return_sec
 SAD_NOD_TILT_DEG = _ft.sad_nod_tilt_deg
 SAD_NOD_COUNT = _ft.sad_nod_count
@@ -532,7 +547,12 @@ def sync_config_from_cfg() -> None:
     global WANDER_BASE_FOLLOW_CHANCE, WANDER_BASE_FOLLOW_DEG
     global WANDER_BASE_FOLLOW_MIN_PAN_DEG, WANDER_BASE_FOLLOW_MIN_DRIFT_VEL
     global WANDER_BASE_FOLLOW_COOLDOWN_SEC, WANDER_BASE_FOLLOW_EVAL_SEC
+    global FACE_BASE_ALIVE_ENABLED, FACE_BASE_ALIVE_DEG, FACE_BASE_ALIVE_MAX_DEG
+    global FACE_BASE_ALIVE_MIN_SEC, FACE_BASE_ALIVE_MAX_SEC
+    global FACE_BASE_EDGE_NORM, FACE_BASE_EDGE_NUDGE_DEG, FACE_BASE_EDGE_PAN_EDGE_DEG
+    global FACE_BASE_COOLDOWN_SEC, FACE_BASE_HEAD_COMP_ALPHA
     global BASE_MAX_DEG_FROM_ZERO
+    global BASE_MAX_NUDGE_DEG, BASE_ERROR_BACKOFF_SEC
     global SAD_RETURN_SEC, SAD_NOD_TILT_DEG, SAD_NOD_COUNT
     global NO_FACE_SAD_RECENTER_ALPHA, WANDER_EMOTIONS
     global SETTLED_SLEEPY_VARIETY_MIN_SEC, SETTLED_SLEEPY_VARIETY_MAX_SEC
@@ -670,6 +690,16 @@ def sync_config_from_cfg() -> None:
     WANDER_BASE_FOLLOW_MIN_DRIFT_VEL = _ft.wander_base_follow_min_drift_vel
     WANDER_BASE_FOLLOW_COOLDOWN_SEC = _ft.wander_base_follow_cooldown_sec
     WANDER_BASE_FOLLOW_EVAL_SEC = _ft.wander_base_follow_eval_sec
+    FACE_BASE_ALIVE_ENABLED = _ft.face_base_alive_enabled
+    FACE_BASE_ALIVE_DEG = _ft.face_base_alive_deg
+    FACE_BASE_ALIVE_MAX_DEG = _ft.face_base_alive_max_deg
+    FACE_BASE_ALIVE_MIN_SEC = _ft.face_base_alive_min_sec
+    FACE_BASE_ALIVE_MAX_SEC = _ft.face_base_alive_max_sec
+    FACE_BASE_EDGE_NORM = _ft.face_base_edge_norm
+    FACE_BASE_EDGE_NUDGE_DEG = _ft.face_base_edge_nudge_deg
+    FACE_BASE_EDGE_PAN_EDGE_DEG = _ft.face_base_edge_pan_edge_deg
+    FACE_BASE_COOLDOWN_SEC = _ft.face_base_cooldown_sec
+    FACE_BASE_HEAD_COMP_ALPHA = _ft.face_base_head_comp_alpha
     SAD_RETURN_SEC = _ft.sad_return_sec
     SAD_NOD_TILT_DEG = _ft.sad_nod_tilt_deg
     SAD_NOD_COUNT = _ft.sad_nod_count
@@ -725,6 +755,8 @@ def sync_config_from_cfg() -> None:
     GOAL_DEADBAND_DEG = _sv.goal_deadband_deg
     BASE_ENABLED = cfg.base.enabled
     BASE_MAX_DEG_FROM_ZERO = cfg.base.max_deg_from_zero
+    BASE_MAX_NUDGE_DEG = cfg.base.max_nudge_deg
+    BASE_ERROR_BACKOFF_SEC = cfg.base.error_backoff_sec
     PAN_MOTION, TILT_MOTION = _head_motion_params_from_servo(_sv)
     HEAD_SEND_MIN_DELTA_DEG = _sv.head_send_min_delta_deg
     PAN_TRACK_RANGE = _sv.pan_track_range
@@ -1532,48 +1564,41 @@ def start_stream_server():
     print(f"MJPEG stream:     http://{STREAM_HOST}:{STREAM_PORT}/stream")
 
 
-# --- Display Setup ---
-print("Initializing Displays (Dual SPI)...")
 disp_l = None
 disp_r = None
 
-# SPI 0 (Left Screen)
-try:
-    spi0 = board.SPI()
-    disp_l = st7735.ST7735R(
-        spi0, 
-        rotation=0, 
-        baudrate=24000000, 
-        bgr=True,
-        cs=digitalio.DigitalInOut(board.CE1),   
-        dc=digitalio.DigitalInOut(board.D24),   
-        rst=digitalio.DigitalInOut(board.D25)
-    )
-except Exception as e:
-    print(f"Error init Left Display (SPI0): {e}")
 
-# SPI 1 (Right Screen)
-try:
-    spi1 = busio.SPI(clock=board.D21, MOSI=board.D20, MISO=board.D19)
-    disp_r = st7735.ST7735R(
-        spi1, 
-        rotation=0, 
-        baudrate=24000000, 
-        bgr=True,
-        cs=digitalio.DigitalInOut(board.D18),   
-        dc=digitalio.DigitalInOut(board.D23),   
-        rst=digitalio.DigitalInOut(board.D27)
-    )
-except Exception as e:
-    print(f"Error init Right Display (SPI1): {e}")
+def _init_spi_displays() -> None:
+    """Dual TFT eyes — runs after camera/vision so CSI init is never blocked."""
+    global disp_l, disp_r
+    print("Initializing Displays (Dual SPI)...")
+    try:
+        spi0 = board.SPI()
+        disp_l = st7735.ST7735R(
+            spi0,
+            rotation=0,
+            baudrate=24000000,
+            bgr=True,
+            cs=digitalio.DigitalInOut(board.CE1),
+            dc=digitalio.DigitalInOut(board.D24),
+            rst=digitalio.DigitalInOut(board.D25),
+        )
+    except Exception as e:
+        print(f"Error init Left Display (SPI0): {e}")
 
-
-# Connect ESP32 before Picamera2 — shared USB bus on Pi can block boot/handshake.
-_boot_servo_driver = None
-if ENABLE_SERVO:
-    print("Connecting ESP32 (before camera USB)...")
-    check_servo_channel_config(cfg.servo.pan_ch, cfg.servo.tilt_ch, backend=cfg.servo.backend)
-    _boot_servo_driver = create_servo_driver(cfg, max_attempts=4, retry_delay_sec=2.0)
+    try:
+        spi1 = busio.SPI(clock=board.D21, MOSI=board.D20, MISO=board.D19)
+        disp_r = st7735.ST7735R(
+            spi1,
+            rotation=0,
+            baudrate=24000000,
+            bgr=True,
+            cs=digitalio.DigitalInOut(board.D18),
+            dc=digitalio.DigitalInOut(board.D23),
+            rst=digitalio.DigitalInOut(board.D27),
+        )
+    except Exception as e:
+        print(f"Error init Right Display (SPI1): {e}")
 
 
 def _apply_camera_colour_controls(picam2: Picamera2) -> None:
@@ -1587,7 +1612,7 @@ def _apply_camera_colour_controls(picam2: Picamera2) -> None:
     )
 
 
-# --- Camera & Face Detector Setup ---
+# --- Camera & Face Detector Setup (CSI Picamera2 first — no USB webcam) ---
 print("Initializing Picamera2...")
 picam2 = None
 try:
@@ -1642,61 +1667,87 @@ try:
         target_id=cv2.dnn.DNN_TARGET_CPU
     )
     print("YuNet initialized.")
+    if CAMERA_WIDE_FOV:
+        # Picamera2 RGB888 buffer is BGR in memory — same as trackingeyes_face_servo.py.
+        camera_color.DETECTION_BGR_MODE = "native_bgr"
+        print("YuNet detection: native_bgr (RGB888 wide-FOV pipeline)")
 except Exception as e:
     print(f"Error initializing detector: {e}")
     sys.exit(1)
 
-print("Probing YuNet BGR layout...")
-try:
-    _boot_capture = picam2.capture_array()
-    if CAMERA_WIDE_FOV:
-        _boot_detect = cv2.resize(_boot_capture, CAMERA_RES, interpolation=cv2.INTER_AREA)
-        if CAMERA_ROTATE_180:
-            _boot_detect = cv2.rotate(_boot_detect, cv2.ROTATE_180)
-        _boot_rgb = (
-            cv2.cvtColor(_boot_detect, cv2.COLOR_BGR2RGB)
-            if STREAM_SWAP_RB
-            else _boot_detect
-        )
-    else:
-        _boot_rgb = frame_to_rgb(
-            _boot_capture,
-            legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
-        )
-        _boot_detect = cv2.resize(_boot_rgb, CAMERA_RES, interpolation=cv2.INTER_AREA)
-    _detection_bgr_mode, _probe_face_count = probe_yunet_bgr_mode(
-        detector,
-        _boot_detect,
-        input_size=CAMERA_RES,
-        rotate_180=False if CAMERA_WIDE_FOV else CAMERA_ROTATE_180,
-    )
-    _color_stats = verify_color_pipeline(_boot_rgb)
-    log_color_pipeline_verification(
-        _color_stats,
-        detection_mode=_detection_bgr_mode,
-        face_probe_count=_probe_face_count,
-    )
-except Exception as e:
-    print(f"Warning: face color probe skipped: {e}")
-
 person_detector = None
-if BODY_ENABLED:
-    print("Initializing YOLOv8 person detector...")
+
+
+def _boot_color_probe():
+    """Non-blocking YuNet BGR layout check (runs after face tracking starts)."""
+    try:
+        _boot_capture = picam2.capture_array()
+        if CAMERA_WIDE_FOV:
+            _boot_detect = cv2.resize(_boot_capture, CAMERA_RES, interpolation=cv2.INTER_AREA)
+            if CAMERA_ROTATE_180:
+                _boot_detect = cv2.rotate(_boot_detect, cv2.ROTATE_180)
+            _boot_rgb = (
+                cv2.cvtColor(_boot_detect, cv2.COLOR_BGR2RGB)
+                if STREAM_SWAP_RB
+                else _boot_detect
+            )
+            mode = "native_bgr"
+            face_count = 0
+            w, h = CAMERA_RES
+            detector.setInputSize((w, h))
+            result = detector.detect(_boot_detect)
+            if result[1] is not None:
+                face_count = len(result[1])
+        else:
+            _boot_rgb = frame_to_rgb(
+                _boot_capture,
+                legacy_swap_rb=STREAM_SWAP_RB and not CAMERA_USE_PREVIEW,
+            )
+            _boot_detect = cv2.resize(_boot_rgb, CAMERA_RES, interpolation=cv2.INTER_AREA)
+            mode, face_count = probe_yunet_bgr_mode(
+                detector,
+                _boot_detect,
+                input_size=CAMERA_RES,
+                rotate_180=CAMERA_ROTATE_180,
+            )
+        camera_color.DETECTION_BGR_MODE = mode
+        _color_stats = verify_color_pipeline(_boot_rgb)
+        log_color_pipeline_verification(
+            _color_stats,
+            detection_mode=mode,
+            face_probe_count=face_count,
+        )
+    except Exception as e:
+        print(f"Warning: face color probe skipped: {e}")
+
+
+def _init_person_detector_background():
+    """YOLO body fallback — optional, loaded after face tracking is live."""
+    global person_detector
+    if not BODY_ENABLED:
+        return
+    print("Initializing YOLOv8 person detector (background)...")
     try:
         if not Path(BODY_MODEL_PATH).exists():
             print(f"Warning: Body model not found at {BODY_MODEL_PATH}")
             print("  Run: python tools/download_models.py yolov8n.onnx")
-        else:
-            person_detector = PersonDetector(
-                BODY_MODEL_PATH,
-                confidence_threshold=BODY_CONFIDENCE_THRESHOLD,
-                nms_threshold=BODY_NMS_THRESHOLD,
-                input_size=BODY_INPUT_SIZE,
-            )
-            print("YOLOv8 person detector initialized.")
+            return
+        person_detector = PersonDetector(
+            BODY_MODEL_PATH,
+            confidence_threshold=BODY_CONFIDENCE_THRESHOLD,
+            nms_threshold=BODY_NMS_THRESHOLD,
+            input_size=BODY_INPUT_SIZE,
+        )
+        print("YOLOv8 person detector initialized.")
     except Exception as e:
         print(f"Warning: Person detector disabled: {e}")
         person_detector = None
+
+
+def _load_animations_background():
+    loaded = _load_default_animation_clips()
+    if loaded:
+        print(f"Animation clips ready ({loaded} loaded)")
 
 
 # --- Eye Objects ---
@@ -1785,6 +1836,8 @@ squint_until = 0.0
 servo_state_lock = threading.Lock()
 servo_thread = None
 servo_driver = None
+_servo_reconnect_lock = threading.Lock()
+_servo_reconnect_pending = False
 servo_target_pan = (PAN_MIN + PAN_MAX) * 0.5
 servo_target_tilt = (TILT_MIN + TILT_MAX) * 0.5
 servo_current_pan = servo_target_pan
@@ -1792,6 +1845,9 @@ servo_current_tilt = servo_target_tilt
 servo_pan_vel = 0.0
 servo_tilt_vel = 0.0
 last_base_fov_nudge_ts = 0.0
+last_face_base_nudge_ts = 0.0
+base_error_until = 0.0
+next_face_base_alive_ts = time.time() + random.uniform(8.0, 16.0)
 last_wander_base_follow_ts = 0.0
 last_wander_base_follow_eval_ts = 0.0
 last_face_seen_ts = time.time()
@@ -1874,22 +1930,19 @@ arm_current_smoothed: dict[str, float] = dict(neutral_arm_targets)
 _last_servo_frame_ts = 0.0
 _last_sent_pan: float | None = None
 _last_sent_tilt: float | None = None
-SERVO_FRAME_INTERVAL = 1.0 / 30.0
+SERVO_FRAME_INTERVAL = serial_send_interval_sec()
 ARM_ANIM_BLEND = 0.45
 BOTANGO_COMMANDS_FILE = "AnimationCommands.json"
 
 tof_lock = threading.Lock()
 tof_snapshot = TofSnapshot.empty()
+tof_poll_ok = False
 tof_presence = TofPresence(False, False, False, False, 0)
 tof_tracker = TofPresenceTracker(
     present_max_mm=TOF_PRESENT_MAX_MM,
     absent_min_mm=TOF_ABSENT_MIN_MM,
     debounce_present_sec=TOF_DEBOUNCE_PRESENT_SEC,
     debounce_absent_sec=TOF_DEBOUNCE_ABSENT_SEC,
-    median_window=_tof.median_window,
-    max_spike_mm=_tof.max_spike_mm,
-    stale_timeout_sec=_tof.stale_timeout_sec,
-    consec_agree=_tof.consec_agree,
 )
 
 
@@ -2183,7 +2236,7 @@ def _apply_detection_aim_point(
 
     mapped_pan = None
     mapped_tilt = None
-    if ENABLE_SERVO and servo_driver is not None:
+    if ENABLE_SERVO:
         pan_center = (PAN_MIN + PAN_MAX) * 0.5
         tilt_center = (TILT_MIN + TILT_MAX) * 0.5
         mapped_pan = clamp(pan_center + (norm_x * PAN_TRACK_RANGE), PAN_MIN, PAN_MAX)
@@ -2201,6 +2254,27 @@ def _apply_detection_aim_point(
     return local_x, local_y, norm_x, norm_y, mapped_pan, mapped_tilt
 
 
+def _base_motion_allowed(now: float) -> bool:
+    if not BASE_ENABLED or servo_driver is None:
+        return False
+    if not getattr(servo_driver, "base_motion_allowed", True):
+        return False
+    if now < base_error_until:
+        return False
+    return hasattr(servo_driver, "write_base_relative_clamped")
+
+
+def _record_base_error(now: float, reason: str) -> None:
+    global base_error_until
+    base_error_until = now + BASE_ERROR_BACKOFF_SEC
+    print(f"Base motion paused {BASE_ERROR_BACKOFF_SEC:.0f}s ({reason})")
+    if servo_driver is not None and hasattr(servo_driver, "write_base_stop"):
+        try:
+            servo_driver.write_base_stop()
+        except Exception:
+            pass
+
+
 def _maybe_search_base_fov_nudge(
     pan_current: float,
     *,
@@ -2208,20 +2282,15 @@ def _maybe_search_base_fov_nudge(
     mode: str,
 ) -> None:
     """Small base rotation when pan nears limit during no-face search."""
-    global last_base_fov_nudge_ts, servo_target_pan
-
+    now = time.time()
     if (
-        not BASE_ENABLED
-        or servo_driver is None
+        not _base_motion_allowed(now)
         or face_locked
         or mode != "wandering"
         or tof_approach_controller.suppresses_wander_base()
     ):
         return
-    if not hasattr(servo_driver, "write_base_relative_clamped"):
-        return
 
-    now = time.time()
     if now - last_base_fov_nudge_ts < SEARCH_BASE_COOLDOWN_SEC:
         return
 
@@ -2238,11 +2307,19 @@ def _maybe_search_base_fov_nudge(
     _apply_wander_base_nudge(nudge_deg, now)
 
 
-def _apply_wander_base_nudge(nudge_deg: float, now: float) -> bool:
-    """Send async base nudge and softly compensate head pan target."""
-    global last_base_fov_nudge_ts, servo_target_pan
+def _apply_wander_base_nudge(
+    nudge_deg: float,
+    now: float,
+    *,
+    face_tracking: bool = False,
+) -> bool:
+    """Base nudge with head pan counter-rotation to hold gaze."""
+    global last_base_fov_nudge_ts, servo_target_pan, servo_current_pan, servo_pan_vel
+    global _last_sent_pan
 
     if abs(nudge_deg) < 0.2:
+        return False
+    if not _base_motion_allowed(now):
         return False
     try:
         st = servo_driver.query_base_status()
@@ -2251,26 +2328,43 @@ def _apply_wander_base_nudge(nudge_deg: float, now: float) -> bool:
         ok = servo_driver.write_base_relative_clamped(
             nudge_deg,
             max_from_zero=BASE_MAX_DEG_FROM_ZERO,
-            wait=False,
+            max_nudge_deg=BASE_MAX_NUDGE_DEG,
+            wait=True,
         )
         if not ok:
+            _record_base_error(now, "ERR B or timeout")
             return False
         last_base_fov_nudge_ts = now
         pan_center = (PAN_MIN + PAN_MAX) * 0.5
+        comp_alpha = (
+            clamp(float(FACE_BASE_HEAD_COMP_ALPHA), 0.2, 1.0)
+            if face_tracking
+            else WANDER_PAN_TARGET_ALPHA
+        )
         with servo_state_lock:
             compensated = clamp(
                 servo_target_pan - nudge_deg,
                 PAN_MIN,
                 PAN_MAX,
             )
-            if abs(compensated - pan_center) < SEARCH_BASE_NUDGE_DEG:
+            if (
+                not face_tracking
+                and abs(compensated - pan_center) < SEARCH_BASE_NUDGE_DEG
+            ):
                 compensated = pan_center
-            servo_target_pan += (
-                compensated - servo_target_pan
-            ) * WANDER_PAN_TARGET_ALPHA
+            servo_target_pan += (compensated - servo_target_pan) * comp_alpha
+            if face_tracking:
+                servo_current_pan = clamp(
+                    servo_current_pan - nudge_deg,
+                    PAN_MIN,
+                    PAN_MAX,
+                )
+                servo_pan_vel = 0.0
+                _last_sent_pan = None
         return True
     except Exception as e:
         print(f"Base wander nudge failed: {e}")
+        _record_base_error(now, str(e))
         return False
 
 
@@ -2283,18 +2377,15 @@ def _maybe_wander_base_follow_nudge(
     """Occasionally rotate base slightly in the direction the head is drifting."""
     global last_wander_base_follow_ts, last_wander_base_follow_eval_ts
 
+    now = time.time()
     if (
-        not BASE_ENABLED
-        or servo_driver is None
+        not _base_motion_allowed(now)
         or face_locked
         or mode != "wandering"
         or tof_approach_controller.suppresses_wander_base()
     ):
         return
-    if not hasattr(servo_driver, "write_base_relative_clamped"):
-        return
 
-    now = time.time()
     if now - last_wander_base_follow_eval_ts < WANDER_BASE_FOLLOW_EVAL_SEC:
         return
     last_wander_base_follow_eval_ts = now
@@ -2319,6 +2410,72 @@ def _maybe_wander_base_follow_nudge(
     nudge_deg = -WANDER_BASE_FOLLOW_DEG if drift_vel > 0 else WANDER_BASE_FOLLOW_DEG
     if _apply_wander_base_nudge(nudge_deg, now):
         last_wander_base_follow_ts = now
+
+
+def _maybe_face_track_base_nudges(
+    pan_current: float,
+    *,
+    face_locked: bool,
+    now: float,
+) -> None:
+    """Small base rotations while face-tracking — alive micro-moves and edge assist."""
+    global last_face_base_nudge_ts, next_face_base_alive_ts
+
+    if (
+        not _base_motion_allowed(now)
+        or not face_locked
+        or tof_approach_controller.suppresses_wander_base()
+    ):
+        return
+
+    if now - last_face_base_nudge_ts < FACE_BASE_COOLDOWN_SEC:
+        return
+    if now - last_base_fov_nudge_ts < 2.0:
+        return
+
+    with servo_state_lock:
+        norm_x = last_face_norm_x
+
+    dist_min = pan_current - PAN_MIN
+    dist_max = PAN_MAX - pan_current
+    head_near_limit = (
+        dist_min <= FACE_BASE_EDGE_PAN_EDGE_DEG
+        or dist_max <= FACE_BASE_EDGE_PAN_EDGE_DEG
+    )
+    face_off_center = abs(norm_x) >= FACE_BASE_EDGE_NORM
+
+    nudge_deg = 0.0
+    cap = max(0.5, float(FACE_BASE_ALIVE_MAX_DEG))
+
+    if face_off_center or head_near_limit:
+        if face_off_center:
+            off = (abs(norm_x) - FACE_BASE_EDGE_NORM) / max(
+                1e-6, 1.0 - FACE_BASE_EDGE_NORM
+            )
+            mag = min(FACE_BASE_EDGE_NUDGE_DEG, cap) * clamp(off, 0.0, 1.0)
+            nudge_deg = -math.copysign(mag, norm_x) if norm_x != 0.0 else 0.0
+        if head_near_limit:
+            limit_nudge = min(FACE_BASE_EDGE_NUDGE_DEG, cap)
+            if dist_max <= FACE_BASE_EDGE_PAN_EDGE_DEG:
+                nudge_deg = -limit_nudge
+            elif dist_min <= FACE_BASE_EDGE_PAN_EDGE_DEG:
+                nudge_deg = limit_nudge
+    elif FACE_BASE_ALIVE_ENABLED and now >= next_face_base_alive_ts:
+        next_face_base_alive_ts = now + random.uniform(
+            FACE_BASE_ALIVE_MIN_SEC,
+            FACE_BASE_ALIVE_MAX_SEC,
+        )
+        alive_mag = min(FACE_BASE_ALIVE_DEG, cap)
+        if abs(norm_x) > 0.12:
+            nudge_deg = -math.copysign(alive_mag * 0.55, norm_x)
+        else:
+            nudge_deg = random.choice([-1.0, 1.0]) * alive_mag * random.uniform(0.4, 0.9)
+
+    if abs(nudge_deg) < 0.35:
+        return
+    nudge_deg = clamp(nudge_deg, -cap, cap)
+    if _apply_wander_base_nudge(nudge_deg, now, face_tracking=True):
+        last_face_base_nudge_ts = now
 
 
 def _servo_home_frame() -> dict[str, float]:
@@ -2463,31 +2620,72 @@ def get_tof_api_payload() -> dict:
     }
 
 
+def _tof_firmware_ok() -> bool:
+    if tof_poll_ok:
+        return True
+    if servo_driver is None:
+        return False
+    link = getattr(servo_driver, "_link", None)
+    return bool(getattr(link, "tof_capable", False))
+
+
 def get_tof_state() -> dict:
     with tof_lock:
-        return {
-            "enabled": bool(TOF_ENABLED),
-            "snapshot": tof_snapshot.as_dict(),
-            "presence": tof_presence.as_dict(),
-            "bearing_deg": tof_approach_controller.last_bearing_deg,
-            "target_pan_offset_deg": tof_approach_controller.last_bearing_deg,
-            "approach_active": bool(tof_approach_controller.active),
-            "approach_phase": tof_approach_controller.phase_name(),
-            "latched_sector": tof_approach_controller.latched_sector,
-            "use_base": bool(TOF_APPROACH_USE_BASE),
-        }
+        snap = tof_snapshot.as_dict()
+        pres = tof_presence.as_dict()
+        bearing = tof_approach_controller.last_bearing_deg
+        approach_active = bool(tof_approach_controller.active)
+        phase = tof_approach_controller.phase_name()
+        latched = tof_approach_controller.latched_sector
+    snap_ts = float(snap.get("timestamp") or 0.0)
+    age_sec = round(time.time() - snap_ts, 2) if snap_ts > 0 else None
+    any_valid = any(
+        snap.get(k) for k in ("left_valid", "center_valid", "right_valid")
+    )
+    firmware_ok = _tof_firmware_ok()
+    if not TOF_ENABLED:
+        status = "disabled"
+    elif not firmware_ok:
+        status = "no_firmware"
+    elif snap_ts <= 0:
+        status = "waiting"
+    elif age_sec is not None and age_sec > 3.0:
+        status = "stale"
+    elif any_valid:
+        status = "live"
+    else:
+        status = "clear"
+    return {
+        "enabled": bool(TOF_ENABLED),
+        "firmware_ok": firmware_ok,
+        "status": status,
+        "age_sec": age_sec,
+        "poll_hz": float(TOF_POLL_HZ),
+        "snapshot": snap,
+        "presence": pres,
+        "bearing_deg": bearing,
+        "target_pan_offset_deg": bearing,
+        "approach_active": approach_active,
+        "approach_phase": phase,
+        "latched_sector": latched,
+        "use_base": bool(TOF_APPROACH_USE_BASE),
+    }
 
 
 def tof_worker():
-    global tof_snapshot, tof_presence, prev_tof_center_present
+    global tof_snapshot, tof_presence, prev_tof_center_present, tof_poll_ok
     if not TOF_ENABLED or servo_driver is None:
         return
     interval = 1.0 / max(0.5, float(TOF_POLL_HZ))
     last_error_log = 0.0
     while running:
         try:
-            snap = servo_driver.poll_tof()
+            with tof_lock:
+                need_init = tof_snapshot.timestamp <= 0
+            poll_timeout = 8.0 if need_init else 0.35
+            snap = servo_driver.poll_tof(timeout=poll_timeout)
             if snap is not None:
+                tof_poll_ok = True
                 snap = sanitize_tof_snapshot(
                     snap,
                     min_valid_mm=TOF_MIN_VALID_MM,
@@ -2580,6 +2778,13 @@ def servo_worker():
         return
 
     while servo_running:
+        if (
+            servo_driver is None
+            or not getattr(servo_driver, "serial_connected", False)
+        ):
+            _schedule_servo_reconnect("serial disconnected")
+            break
+
         now = time.time()
 
         with target_lock:
@@ -2746,6 +2951,11 @@ def servo_worker():
                 face_locked=face_locked,
                 mode=no_face_mode,
             )
+        _maybe_face_track_base_nudges(
+            pan_current,
+            face_locked=face_locked,
+            now=now,
+        )
 
         global _last_sent_pan, _last_sent_tilt
         head_moved = (
@@ -2774,15 +2984,21 @@ def servo_worker():
                 frame_tokens["A3="] = clamp(
                     arm_current_smoothed.get("arm_3", neutral_arm_targets.get("arm_3", 90.0)), 0.0, 180.0
                 )
+                ok = False
                 if hasattr(servo_driver, "write_servo_frame"):
-                    servo_driver.write_servo_frame(frame_tokens)
+                    ok = bool(servo_driver.write_servo_frame(frame_tokens))
                 else:
-                    servo_driver.write_angles(pan_current, tilt_current)
+                    ok = bool(servo_driver.write_angles(pan_current, tilt_current))
+                if not ok:
+                    _schedule_servo_reconnect("write failed")
+                    break
                 _last_servo_frame_ts = now
                 _last_sent_pan = pan_current
                 _last_sent_tilt = tilt_current
             except Exception as e:
                 print(f"Servo write error: {e}")
+                _schedule_servo_reconnect(str(e))
+                break
 
         with servo_state_lock:
             servo_current_pan = pan_current
@@ -2856,6 +3072,25 @@ def mirror_full_state(master, slave):
     slave.h = master.h
 
 
+def _read_cpu_temp_c() -> float | None:
+    """SoC temperature in °C (Raspberry Pi thermal zone or vcgencmd)."""
+    try:
+        raw = Path("/sys/class/thermal/thermal_zone0/temp").read_text(encoding="utf-8").strip()
+        return round(int(raw) / 1000.0, 1)
+    except Exception:
+        pass
+    try:
+        out = subprocess.check_output(
+            ["vcgencmd", "measure_temp"],
+            text=True,
+            timeout=1.0,
+        )
+        # temp=84.2'C
+        return round(float(out.split("=")[1].split("'")[0]), 1)
+    except Exception:
+        return None
+
+
 def get_runtime_state() -> dict:
     """Thread-safe snapshot of live robot state for the debug dashboard."""
     with target_lock:
@@ -2884,10 +3119,21 @@ def get_runtime_state() -> dict:
         active_clip = animation_player.active_clip_id()
     servo["animation_clip"] = active_clip
     if servo_driver is not None:
-        servo["serial_connected"] = getattr(servo_driver, "serial_connected", False)
+        link = getattr(servo_driver, "_link", None)
+        servo["serial_connected"] = bool(
+            getattr(servo_driver, "serial_connected", False)
+            or (link is not None and link.connected)
+        )
+    else:
+        servo["serial_connected"] = False
+
+    cpu_temp_c = _read_cpu_temp_c()
 
     return {
         "timestamp": time.time(),
+        "system": {
+            "cpu_temp_c": cpu_temp_c,
+        },
         "session_active": session_active,
         "emotion": {
             "current": current_emotion,
@@ -3037,11 +3283,13 @@ def _prepare_vision_frames(large_frame):
 
 def _detect_faces_on_frame(frame_raw):
     if CAMERA_WIDE_FOV:
-        return detect_faces_yunet_fast(
-            detector,
-            frame_raw,
-            input_size=CAMERA_RES,
-        )
+        # Match trackingeyes_face_servo.py: pass capture buffer directly to YuNet.
+        w, h = CAMERA_RES[0], CAMERA_RES[1]
+        detector.setInputSize((w, h))
+        result = detector.detect(frame_raw)
+        if result[1] is None:
+            return None
+        return result[1]
     detected_faces, _ = detect_faces_yunet(
         detector,
         frame_raw,
@@ -3375,6 +3623,11 @@ def _start_servo_hardware(driver) -> None:
         f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
         f"— face tracking enabled"
     )
+    if hasattr(servo_driver, "_link"):
+        try:
+            prepare_esp32_for_live_control(servo_driver._link)
+        except Exception:
+            pass
     servo_running = True
     servo_thread = threading.Thread(target=servo_worker, daemon=True)
     servo_thread.start()
@@ -3388,32 +3641,82 @@ def _start_servo_hardware(driver) -> None:
             )
 
 
+def _schedule_servo_reconnect(reason: str) -> None:
+    """Drop stale link and retry ESP32 in background (USB unplug, port busy, etc.)."""
+    global servo_running, servo_driver, _servo_reconnect_pending
+
+    if not ENABLE_SERVO or not running:
+        return
+    with _servo_reconnect_lock:
+        if _servo_reconnect_pending:
+            return
+        _servo_reconnect_pending = True
+
+    print(f"ESP32 serial lost ({reason}) — reconnecting...")
+    servo_running = False
+    old_driver = servo_driver
+    servo_driver = None
+    if old_driver is not None:
+        try:
+            old_driver.close(skip_home=True)
+        except Exception:
+            pass
+    threading.Thread(target=_servo_reconnect_worker, daemon=True).start()
+
+
+def _servo_reconnect_worker() -> None:
+    global _servo_reconnect_pending
+    try:
+        time.sleep(1.0)
+        _servo_connect_worker()
+    finally:
+        with _servo_reconnect_lock:
+            _servo_reconnect_pending = False
+
+
 def _servo_connect_worker() -> None:
-    """Background ESP32 connect when early boot or camera load delays READY."""
+    """Background ESP32 connect — never blocks camera or face tracking."""
     global running
-    delay_sec = 5.0
+    if ENABLE_SERVO:
+        check_servo_channel_config(cfg.servo.pan_ch, cfg.servo.tilt_ch, backend=cfg.servo.backend)
+    fail_count = 0
     while running and not servo_running:
-        driver = create_servo_driver(cfg, max_attempts=2, retry_delay_sec=2.0)
+        driver = create_servo_driver(cfg, max_attempts=1, retry_delay_sec=1.0)
         if driver is not None:
             _start_servo_hardware(driver)
             return
-        time.sleep(delay_sec)
+        fail_count += 1
+        if fail_count == 1 or fail_count % 6 == 0:
+            print(
+                "ESP32 not connected yet — check USB cable and stop other scripts "
+                "using /dev/ttyUSB0 (test_head_servos.py, etc.)"
+            )
+        time.sleep(min(2.0 + fail_count * 0.4, 8.0))
 
 
-print("Starting Tracking Loop...")
-time.sleep(1.0) # Warmup
-
-_load_default_animation_clips()
-
-if ENABLE_SERVO:
-    if _boot_servo_driver is not None:
-        _start_servo_hardware(_boot_servo_driver)
-    elif not servo_running:
-        print(
-            "Head servo driver unavailable at startup; "
-            "retrying ESP32 connect in background..."
-        )
+def _start_deferred_services() -> None:
+    """HTTP debug stream, ESP32 servos, YOLO, animations — after vision is live."""
+    if ENABLE_SERVO and not servo_running:
+        print("Connecting ESP32 in background (head tracking works without it)...")
         threading.Thread(target=_servo_connect_worker, daemon=True).start()
+    if STREAM_ENABLED:
+        try:
+            start_stream_server()
+        except Exception as e:
+            print(f"Error starting debug HTTP server: {e}")
+    threading.Thread(target=_boot_color_probe, daemon=True).start()
+    threading.Thread(target=_init_person_detector_background, daemon=True).start()
+    threading.Thread(target=_load_animations_background, daemon=True).start()
+
+
+print("Starting face tracking...")
+vision_thread = threading.Thread(target=vision_worker, daemon=True)
+vision_thread.start()
+udp_thread = threading.Thread(target=udp_worker, daemon=True)
+udp_thread.start()
+_init_spi_displays()
+_start_deferred_services()
+print("Face tracking active — eyes and servos follow camera")
 
 
 def _handle_shutdown_signal(signum, frame):
@@ -3425,18 +3728,6 @@ def _handle_shutdown_signal(signum, frame):
 
 signal.signal(signal.SIGINT, _handle_shutdown_signal)
 signal.signal(signal.SIGTERM, _handle_shutdown_signal)
-
-if STREAM_ENABLED:
-    try:
-        start_stream_server()
-    except Exception as e:
-        print(f"Error starting debug HTTP server: {e}")
-
-vision_thread = threading.Thread(target=vision_worker, daemon=True)
-vision_thread.start()
-
-udp_thread = threading.Thread(target=udp_worker, daemon=True)
-udp_thread.start()
 
 try:
     # ── Tracking & Emotion History (Pre-Initialization to prevent crashes) ──

@@ -210,6 +210,16 @@ class FaceTrackingConfig:
     wander_base_follow_min_drift_vel: float = 2.5
     wander_base_follow_cooldown_sec: float = 10.0
     wander_base_follow_eval_sec: float = 2.2
+    face_base_alive_enabled: bool = True
+    face_base_alive_deg: float = 3.5
+    face_base_alive_max_deg: float = 5.0
+    face_base_alive_min_sec: float = 14.0
+    face_base_alive_max_sec: float = 24.0
+    face_base_edge_norm: float = 0.48
+    face_base_edge_nudge_deg: float = 4.0
+    face_base_edge_pan_edge_deg: float = 8.0
+    face_base_cooldown_sec: float = 4.5
+    face_base_head_comp_alpha: float = 0.95
     sad_return_sec: float = 10.0
     sad_nod_tilt_deg: float = 10.0
     sad_nod_count: float = 2.0
@@ -294,7 +304,7 @@ class GazeConfig:
 class ServoConfig:
     enabled: bool = True
     backend: str = "arduino"
-    arduino_port: str = ""
+    arduino_port: str = "/dev/ttyUSB0"
     arduino_baud: int = 115200
     pan_ch: int = 4
     tilt_ch: int = 5
@@ -308,17 +318,17 @@ class ServoConfig:
     loop_delay: float = 0.01
     max_step_deg: float = 1.4
     deadzone_deg: float = 0.22
-    pan_max_vel: float = 22.0
-    pan_accel: float = 55.0
-    pan_decel: float = 85.0
+    pan_max_vel: float = 40.0
+    pan_accel: float = 130.0
+    pan_decel: float = 180.0
     pan_track_gain: float = 1.6
-    tilt_max_vel_up: float = 18.0
+    tilt_max_vel_up: float = 24.0
     tilt_max_vel_down: float = 10.0
-    tilt_accel: float = 45.0
-    tilt_decel: float = 70.0
-    tilt_decel_down_mult: float = 1.85
-    head_vel_blend: float = 0.28
-    tilt_head_vel_blend: float = 0.12
+    tilt_accel: float = 85.0
+    tilt_decel: float = 170.0
+    tilt_decel_down_mult: float = 2.20
+    head_vel_blend: float = 0.30
+    tilt_head_vel_blend: float = 0.30
     tilt_track_gain: float = 2.4
     goal_deadband_deg: float = 0.03
     head_send_min_delta_deg: float = 0.025
@@ -347,7 +357,9 @@ class BaseConfig:
     counts_per_degree: float = 1.0
     max_relative_deg: float = 180.0
     max_deg_from_zero: float = 20.0
-    move_timeout_sec: float = 15.0
+    max_nudge_deg: float = 5.0
+    move_timeout_sec: float = 8.0
+    error_backoff_sec: float = 45.0
 
 
 @dataclass
@@ -358,7 +370,7 @@ class TofApproachConfig:
     boot_pan_step_deg: float = 30.0
     arrival_deg: float = 3.0
     use_base: bool = True
-    base_nudge_deg: float = 12.0
+    base_nudge_deg: float = 5.0
     max_base_nudges_per_event: int = 1
     confirm_delay_sec: float = 0.6
     lockout_sec: float = 10.0
@@ -385,11 +397,6 @@ class TofConfig:
     debounce_absent_sec: float = 0.5
     labels: list[str] = field(default_factory=lambda: ["left", "center", "right"])
     mux_channels: list[int] = field(default_factory=lambda: [0, 1, 2])
-    # Reliability filtering (fix/tof-reliability)
-    median_window: int = 5
-    max_spike_mm: int = 600
-    stale_timeout_sec: float = 2.0
-    consec_agree: int = 2
     approach: TofApproachConfig = field(default_factory=TofApproachConfig)
 
 

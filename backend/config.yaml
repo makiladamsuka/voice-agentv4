@@ -13,6 +13,7 @@ display:
   floor_y_offset: 5  # floor_y = screen_height - this
 
 camera:
+  # CSI Picamera2 only (IMX219). Unplug any USB webcam — it competes with ESP32 on USB.
   face_model_path: face_detection_yunet_2023mar.onnx
   body_model_path: yolov8n.onnx
   body_enabled: true
@@ -158,6 +159,16 @@ face_tracking:
   wander_base_follow_min_drift_vel: 2.5
   wander_base_follow_cooldown_sec: 10.0
   wander_base_follow_eval_sec: 2.2
+  face_base_alive_enabled: true
+  face_base_alive_deg: 3.5
+  face_base_alive_max_deg: 5.0
+  face_base_alive_min_sec: 14.0
+  face_base_alive_max_sec: 24.0
+  face_base_edge_norm: 0.48
+  face_base_edge_nudge_deg: 4.0
+  face_base_edge_pan_edge_deg: 8.0
+  face_base_cooldown_sec: 4.5
+  face_base_head_comp_alpha: 0.95
   sad_return_sec: 10.0
   sad_nod_tilt_deg: 10.0
   sad_nod_count: 2.0
@@ -279,17 +290,17 @@ servo:
   loop_delay: 0.01
   max_step_deg: 1.4
   deadzone_deg: 0.22
-  pan_max_vel: 18.0
-  pan_accel: 42.0
-  pan_decel: 58.0
+  pan_max_vel: 40.0
+  pan_accel: 130.0
+  pan_decel: 180.0
   pan_track_gain: 1.25
-  tilt_max_vel_up: 18.0
+  tilt_max_vel_up: 24.0
   tilt_max_vel_down: 10.0
-  tilt_accel: 45.0
-  tilt_decel: 70.0
-  tilt_decel_down_mult: 1.85
-  head_vel_blend: 0.42
-  tilt_head_vel_blend: 0.14
+  tilt_accel: 85.0
+  tilt_decel: 170.0
+  tilt_decel_down_mult: 2.20
+  head_vel_blend: 0.30
+  tilt_head_vel_blend: 0.30
   tilt_track_gain: 2.4
   goal_deadband_deg: 0.03
   head_send_min_delta_deg: 0.025
@@ -313,10 +324,12 @@ servo:
 
 base:
   enabled: true
-  counts_per_degree: 37.855556
+  counts_per_degree: 37.622222  # set by --calibrate-manual# set by --calibrate-manual
   max_relative_deg: 180.0
   max_deg_from_zero: 20.0
-  move_timeout_sec: 15.0
+  max_nudge_deg: 5.0
+  move_timeout_sec: 8.0
+  error_backoff_sec: 45.0
 
 tof:
   enabled: true
@@ -328,11 +341,6 @@ tof:
   debounce_absent_sec: 0.5
   labels: [left, center, right]
   mux_channels: [0, 1, 2]
-  # Reliability filtering (fix/tof-reliability)
-  median_window: 5          # rolling median filter window per channel
-  max_spike_mm: 600         # reject readings jumping > this from rolling median
-  stale_timeout_sec: 2.0    # invalidate channel after this long with no good reads
-  consec_agree: 2           # require N consecutive matching raw states before flip
   approach:
     enabled: true
     head_turn_deg: 30.0
@@ -340,7 +348,7 @@ tof:
     boot_pan_step_deg: 30.0
     arrival_deg: 3.0
     use_base: true
-    base_nudge_deg: 12.0
+    base_nudge_deg: 5.0
     max_base_nudges_per_event: 1
     confirm_delay_sec: 0.6
     lockout_sec: 10.0

@@ -82,8 +82,46 @@ def _is_plausible_serial_line(line: str) -> bool:
 
 def resolve_port(port: str) -> list[str]:
     if port:
+        if os.path.exists(port):
+            return [port]
+        fallbacks = [p for p in DEFAULT_PORTS if os.path.exists(p)]
+        if fallbacks:
+            print(
+                f"Configured serial port {port} not found; using {fallbacks[0]} instead"
+            )
+            return fallbacks
         return [port]
     return [p for p in DEFAULT_PORTS if os.path.exists(p)]
+
+
+def wait_for_serial_port(port: str, timeout_sec: float = 45.0) -> str | None:
+    """Block until the ESP32 serial device appears (USB hotplug / slow boot)."""
+    deadline = time.time() + max(1.0, timeout_sec)
+    last_log = 0.0
+    while time.time() < deadline:
+        candidates = resolve_port(port)
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        now = time.time()
+        if now - last_log >= 5.0:
+            label = port or "ESP32 (/dev/ttyUSB0 or /dev/ttyACM0)"
+            print(f"Waiting for {label} — plug in USB cable if disconnected...")
+            last_log = now
+        time.sleep(0.4)
+    return None
+
+
+def _serial_busy_message(port: str, exc: BaseException) -> str | None:
+    errno = getattr(exc, "errno", None)
+    text = str(exc).lower()
+    if errno in (11, 16) or "busy" in text or "could not open port" in text and "permission" in text:
+        return (
+            f"Serial port {port} is busy or permission denied.\n"
+            "  Stop start_robot.py / test_head_servos.py (only one program can use ESP32).\n"
+            "  Add user to dialout: sudo usermod -aG dialout $USER  (then log out/in)."
+        )
+    return None
 
 
 class ArduinoServoLink:
@@ -105,6 +143,8 @@ class ArduinoServoLink:
         self._tof_capable = False
         self._boot_lines: list[str] = []
         self._lock = threading.RLock()
+        self._allow_dtr_reset = True
+        self._port_wait_sec = 0.0
 
     @property
     def connected(self) -> bool:
@@ -174,11 +214,12 @@ class ArduinoServoLink:
         self._error_logged = False
         self._last_pan = None
         self._last_tilt = None
-        if not self._tof_capable:
+        if not self._tof_capable and not getattr(self, "_skip_tof_probe_at_connect", False):
             try:
                 self._ser.write(b"F\n")
                 self._ser.flush()
-                probe = self._read_tof_line(2.5)
+                # Short probe at connect; tof_worker does full init later.
+                probe = self._read_tof_line(2.0)
             except serial.SerialException:
                 probe = None
             if probe is not None:
@@ -272,18 +313,23 @@ class ArduinoServoLink:
         if self._send_command_and_wait(b"H\n", HANDSHAKE_TIMEOUT_SEC):
             return self._finalize_connect(port)
 
-        if not allow_reset:
+        if not allow_reset or not getattr(self, "_allow_dtr_reset", True):
             if self._stalled_after_mux():
                 if self._recovery_poll_handshake(STALLED_BOOT_RECOVERY_SEC):
                     return self._finalize_connect(port)
             self._print_no_ready_help(port)
             return False
 
-        # 3) One controlled reboot to capture a clean boot log.
+        # 3) One controlled reboot to capture a clean boot log (tests / first connect only).
         self._ser.reset_input_buffer()
         self._esp32_reset()
         time.sleep(POST_CONNECT_DELAY_SEC + 0.65)
-        if self._listen_for_ready(time.time() + BOOT_READ_TIMEOUT_SEC):
+        boot_timeout = (
+            BOOT_READ_TIMEOUT_SEC
+            if getattr(self, "_allow_dtr_reset", True)
+            else min(BOOT_READ_TIMEOUT_SEC, 6.0)
+        )
+        if self._listen_for_ready(time.time() + boot_timeout):
             return self._finalize_connect(port)
 
         # 4) Post-boot commands.
@@ -310,18 +356,21 @@ class ArduinoServoLink:
             print("pyserial not installed; pip install pyserial")
             return False
 
+        wait_sec = float(getattr(self, "_port_wait_sec", 0.0) or 0.0)
         ports = resolve_port(self._port_name)
-        if not ports:
-            if self._port_name:
+        if not ports or (self._port_name and not os.path.exists(self._port_name)):
+            found = wait_for_serial_port(self._port_name, wait_sec if wait_sec > 0 else 45.0)
+            if found is None:
+                label = self._port_name or ", ".join(DEFAULT_PORTS)
                 print(
-                    f"Arduino serial connect failed: port {self._port_name!r} not found. "
-                    "Plug in the ESP32 USB cable."
+                    f"ESP32 serial not found ({label}).\n"
+                    "  Check USB cable and power; only one program can open the port."
                 )
-            else:
-                print(
-                    "Arduino serial connect failed: no serial ports found "
-                    f"({', '.join(DEFAULT_PORTS)}). Plug in the ESP32."
-                )
+                return False
+            ports = [found]
+        elif not ports:
+            label = self._port_name or ", ".join(DEFAULT_PORTS)
+            print(f"ESP32 serial not found ({label}).")
             return False
 
         last_err: Optional[BaseException] = None
@@ -337,6 +386,10 @@ class ArduinoServoLink:
                 except Exception as e:
                     last_err = e
                     self.close()
+                    busy = _serial_busy_message(port, e)
+                    if busy:
+                        print(busy)
+                        return False
                     if attempt < 2:
                         time.sleep(0.5)
 
@@ -445,11 +498,22 @@ class ArduinoServoLink:
             return None
         if line.startswith("ERR B"):
             print(line)
+            self._ensure_base_stopped()
             return None
         match = _BASE_ACK_RE.match(line)
         if match:
             return float(match.group(1))
         return None
+
+    def _ensure_base_stopped(self) -> None:
+        """Send stop after firmware ERR B (belt-and-suspenders)."""
+        if not self._connected or self._ser is None:
+            return
+        try:
+            self._ser.write(b"X\n")
+            self._ser.flush()
+        except Exception:
+            pass
 
     def send_line(
         self,
@@ -487,6 +551,8 @@ class ArduinoServoLink:
                 self._last_ack = self.read_ack()
             if wait_base:
                 self._last_base_ack = self.read_base_ack()
+                if self._last_base_ack is None:
+                    return False
             elif drain_after and not wait_servo:
                 self._drain_rx()
             return True
@@ -529,6 +595,22 @@ class ArduinoServoLink:
         self._last_pan = None
         self._last_tilt = None
         return True
+
+    def flush_pending_commands(self, settle_sec: float = 0.15) -> None:
+        """Stop base and let ESP32 process any queued serial commands before live control."""
+        with self._lock:
+            if not self._connected or self._ser is None:
+                return
+            try:
+                self._send_line_unlocked("X", drain_after=False)
+            except Exception:
+                pass
+            deadline = time.time() + max(0.05, settle_sec)
+            while time.time() < deadline:
+                self._drain_rx()
+                time.sleep(0.01)
+            self._last_pan = None
+            self._last_tilt = None
 
     def write_angles(
         self,

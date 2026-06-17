@@ -30,6 +30,7 @@ import time
 import _bootstrap  # noqa: F401
 
 from arduino_servo import ArduinoServoLink
+from esp32_serial import connect_esp32, prepare_esp32_for_live_control
 from base_motor_utils import CONFIG_PATH, apply_config_cpd_to_nano, load_move_timeout
 
 # No key repeat for this long => key released (terminal auto-repeat)
@@ -276,16 +277,17 @@ def main() -> int:
         print("robottest needs an interactive terminal (SSH -t or local console).")
         return 1
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
     link.base_move_timeout_sec = load_move_timeout()
 
-    if not link.connect():
+    if link is None:
         print("Failed to connect. Check USB and stop other serial users.")
         return 1
 
     try:
         if not args.no_config_cpd:
             apply_config_cpd_to_nano(link)
+        prepare_esp32_for_live_control(link)
 
         print("Tip: reflash ESP32 firmware if M/N do nothing — needs L/R/X spin commands.")
         run_interactive(link, head_step=args.head_step)

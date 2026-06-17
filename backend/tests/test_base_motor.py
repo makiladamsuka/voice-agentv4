@@ -19,6 +19,7 @@ import time
 import _bootstrap  # noqa: F401
 
 from arduino_servo import ArduinoServoLink, BASE_MOVE_TIMEOUT_SEC, BOOT_CPD
+from esp32_serial import connect_esp32, prepare_esp32_for_live_control
 from base_motor_utils import (
     CONFIG_PATH,
     apply_config_cpd_to_nano,
@@ -295,16 +296,18 @@ def main() -> int:
     parser.add_argument("--demo", action="store_true", help="Run demo sweep")
     args = parser.parse_args()
 
-    link = ArduinoServoLink(port=args.port, baud=args.baud)
+    link = connect_esp32(port=args.port, baud=args.baud, prepare=False)
     link.base_move_timeout_sec = load_move_timeout()
 
-    if not link.connect():
+    if link is None:
         print("Failed to connect. Check USB, dialout, and firmware READY.")
         return 1
 
     try:
         if needs_config_cpd_on_connect(args):
             apply_config_cpd_to_nano(link)
+        if not (args.zero or args.status or args.watch or args.calibrate or args.calibrate_manual):
+            prepare_esp32_for_live_control(link)
 
         if args.zero:
             link.zero_base()
