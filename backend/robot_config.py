@@ -385,6 +385,11 @@ class TofConfig:
     debounce_absent_sec: float = 0.5
     labels: list[str] = field(default_factory=lambda: ["left", "center", "right"])
     mux_channels: list[int] = field(default_factory=lambda: [0, 1, 2])
+    # Reliability filtering (fix/tof-reliability)
+    median_window: int = 5
+    max_spike_mm: int = 600
+    stale_timeout_sec: float = 2.0
+    consec_agree: int = 2
     approach: TofApproachConfig = field(default_factory=TofApproachConfig)
 
 

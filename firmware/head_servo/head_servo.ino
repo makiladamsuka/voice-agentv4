@@ -42,10 +42,20 @@ const uint8_t TOF_MUX_CH[3] = {0, 1, 2};  // left, center, right
 const uint8_t TOF_SENSOR_COUNT = 3;
 const uint16_t TOF_INVALID_MM = 8190;
 const uint16_t TOF_MIN_VALID_MM = 30;
-const uint8_t TOF_MUX_SETTLE_MS = 40;
+const uint16_t TOF_MAX_PLAUSIBLE_MM = 3000;  // reject readings > 3m as noise
+const uint8_t TOF_MUX_SETTLE_MS = 10;  // reduced; real settling in multi-read
 // Long-range profile: ~2 m on white targets (default mode tops out ~1.2 m).
 const Adafruit_VL53L0X::VL53L0X_Sense_config_t TOF_SENSE_MODE =
     Adafruit_VL53L0X::VL53L0X_SENSE_LONG_RANGE;
+
+// --- Median filter: take 3 samples, return the middle value ---
+const uint8_t TOF_MEDIAN_SAMPLES = 3;
+// Rate-limit recovery attempts (don't re-init every failed read)
+const unsigned long TOF_RECOVER_COOLDOWN_MS = 5000;
+// Stale timeout: mark sensor invalid if no good read in this window
+const unsigned long TOF_STALE_TIMEOUT_MS = 2000;
+// Consecutive valid reads required before accepting
+const uint8_t TOF_CONSEC_VALID_REQUIRED = 2;
 // PAN_CH=4 pan servo, TILT_CH=5 tilt — must match config.yaml & backend/head_servo_axes.py
 const uint8_t PAN_CH = 4;  // pan (horizontal)
 const uint8_t TILT_CH = 5;  // tilt (vertical)
@@ -109,6 +119,13 @@ bool tofStreamEnabled = false;
 float tofStreamHz = 5.0f;
 unsigned long lastTofSweepMs = 0;
 unsigned long lastTofStreamMs = 0;
+
+// Per-sensor reliability state
+unsigned long tofLastRecoverAttemptMs[3] = {0, 0, 0};
+unsigned long tofLastGoodReadMs[3] = {0, 0, 0};
+uint8_t tofConsecValid[3] = {0, 0, 0};
+uint8_t tofConsecInvalid[3] = {0, 0, 0};
+int16_t tofPrevMm[3] = {-1, -1, -1};  // previous accepted reading for spike rejection
 
 struct ParsedCommand {
   bool hasPan;
@@ -535,9 +552,32 @@ void applyParsedCommand(const ParsedCommand &cmd) {
   }
 }
 
+// ── Sorting helper for median filter ──
+void sortInt16(int16_t *arr, uint8_t n) {
+  for (uint8_t i = 0; i < n - 1; i++) {
+    for (uint8_t j = i + 1; j < n; j++) {
+      if (arr[j] < arr[i]) {
+        int16_t tmp = arr[i];
+        arr[i] = arr[j];
+        arr[j] = tmp;
+      }
+    }
+  }
+}
+
 int16_t sanitizeTofRangeMm(uint16_t raw) {
   if (raw >= TOF_INVALID_MM) return -1;
+  if (raw > TOF_MAX_PLAUSIBLE_MM) return -1;  // reject implausible far readings
   return (int16_t)raw;
+}
+
+// Check VL53L0X range status byte — reject sigma failures and signal-too-weak.
+// Status 0 = valid, 1 = sigma fail, 2 = signal fail, 4 = out of bounds.
+bool isRangeStatusGood(Adafruit_VL53L0X &sensor) {
+  uint8_t status = sensor.readRangeStatus();
+  // Status 0 = range valid.
+  // Status 4 = phase out of bounds (usually means far target, allow it).
+  return (status == 0 || status == 4);
 }
 
 void printTofLine() {
@@ -600,6 +640,13 @@ bool recoverVl53OnMux(uint8_t idx) {
   if (!tofMuxReady || idx >= TOF_SENSOR_COUNT) {
     return false;
   }
+  // Rate-limit recovery attempts to avoid I2C bus spam
+  unsigned long now = millis();
+  if (now - tofLastRecoverAttemptMs[idx] < TOF_RECOVER_COOLDOWN_MS) {
+    return false;
+  }
+  tofLastRecoverAttemptMs[idx] = now;
+
   if (!tcaSelect(TOF_MUX_CH[idx])) {
     return false;
   }
@@ -609,6 +656,11 @@ bool recoverVl53OnMux(uint8_t idx) {
     return false;
   }
   tofSensorOk[idx] = true;
+  tofConsecValid[idx] = 0;  // reset after re-init
+  tofConsecInvalid[idx] = 0;
+  Serial.print(F("TOF ch"));
+  Serial.print(TOF_MUX_CH[idx]);
+  Serial.println(F(" recovered"));
   return true;
 }
 
@@ -637,7 +689,33 @@ void printTofMuxScan() {
   }
 }
 
+// Take a single raw reading from one sensor channel with status validation.
+int16_t readTofSingleRaw(uint8_t idx) {
+  if (!tcaSelect(TOF_MUX_CH[idx])) {
+    return -1;
+  }
+  delay(TOF_MUX_SETTLE_MS);
+  uint16_t raw = vl53[idx].readRange();
+  // Check range status — reject sigma failures and weak-signal reads
+  if (!isRangeStatusGood(vl53[idx])) {
+    return -1;
+  }
+  return sanitizeTofRangeMm(raw);
+}
+
+// Spike rejection: if new reading jumps too far from previous accepted value,
+// treat it as noise. Allows first reading or gradual changes.
+bool isSpikeReading(uint8_t idx, int16_t mm) {
+  if (tofPrevMm[idx] < 0) return false;  // no previous → accept
+  int16_t delta = abs(mm - tofPrevMm[idx]);
+  // Allow up to 800mm jump per poll cycle (~200ms at 5Hz).
+  // A person walking fast covers ~2m/s = 400mm per 200ms.
+  // 800mm gives headroom for sensor jitter while catching wild spikes.
+  return delta > 800;
+}
+
 bool readTofOnChannel(uint8_t idx) {
+  unsigned long now = millis();
   if (!tofMuxReady || idx >= TOF_SENSOR_COUNT) {
     tofDistanceMm[idx] = -1;
     tofValid[idx] = false;
@@ -648,27 +726,61 @@ bool readTofOnChannel(uint8_t idx) {
     tofValid[idx] = false;
     return false;
   }
-  if (!tcaSelect(TOF_MUX_CH[idx])) {
-    tofDistanceMm[idx] = -1;
-    tofValid[idx] = false;
+
+  // --- Median-of-3 filter ---
+  // Take 3 rapid samples, use the median to suppress outliers.
+  int16_t samples[TOF_MEDIAN_SAMPLES];
+  uint8_t goodCount = 0;
+  for (uint8_t s = 0; s < TOF_MEDIAN_SAMPLES; s++) {
+    int16_t mm = readTofSingleRaw(idx);
+    if (mm >= (int16_t)TOF_MIN_VALID_MM) {
+      samples[goodCount++] = mm;
+    }
+  }
+
+  if (goodCount == 0) {
+    // All 3 samples failed — count consecutive invalid
+    tofConsecInvalid[idx]++;
+    tofConsecValid[idx] = 0;
+    // Only mark truly invalid after stale timeout
+    if (now - tofLastGoodReadMs[idx] > TOF_STALE_TIMEOUT_MS) {
+      tofDistanceMm[idx] = -1;
+      tofValid[idx] = false;
+      // After many consecutive failures, mark sensor for recovery
+      if (tofConsecInvalid[idx] > 10) {
+        tofSensorOk[idx] = false;
+      }
+    }
+    // else: keep previous valid reading (hold-last-good)
     return false;
   }
-  delay(TOF_MUX_SETTLE_MS);
-  uint16_t raw = vl53[idx].readRange();
-  int16_t mm = sanitizeTofRangeMm(raw);
-  if (mm < 0) {
-    tofDistanceMm[idx] = -1;
-    tofValid[idx] = false;
+
+  // Sort for median
+  sortInt16(samples, goodCount);
+  int16_t median = samples[goodCount / 2];
+
+  // Spike rejection: if median jumps wildly from previous, ignore
+  if (isSpikeReading(idx, median)) {
+    // Don't update — treat as transient noise
+    tofConsecValid[idx] = 0;
     return false;
   }
-  if (mm > 0 && mm < (int16_t)TOF_MIN_VALID_MM) {
-    tofDistanceMm[idx] = -1;
-    tofValid[idx] = false;
+
+  // Consecutive-valid gating: require N good readings in a row
+  // before we switch from invalid→valid (prevents single-sample triggers)
+  tofConsecValid[idx]++;
+  tofConsecInvalid[idx] = 0;
+
+  if (!tofValid[idx] && tofConsecValid[idx] < TOF_CONSEC_VALID_REQUIRED) {
+    // Not yet confirmed — store value but don't mark valid
     return false;
   }
-  tofDistanceMm[idx] = mm;
-  tofValid[idx] = (mm > 0);
-  return tofValid[idx];
+
+  tofDistanceMm[idx] = median;
+  tofValid[idx] = true;
+  tofPrevMm[idx] = median;
+  tofLastGoodReadMs[idx] = now;
+  return true;
 }
 
 void readAllTof() {
@@ -908,7 +1020,7 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   Wire.setClock(100000);
-  Wire.setTimeOut(50);
+  Wire.setTimeOut(100);  // increased for VL53L0X long-range mode (needs more time)
   Wire.beginTransmission(0x40);
   if (Wire.endTransmission() == 0) {
     pwm.begin();

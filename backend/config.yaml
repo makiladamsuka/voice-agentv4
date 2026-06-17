@@ -328,6 +328,11 @@ tof:
   debounce_absent_sec: 0.5
   labels: [left, center, right]
   mux_channels: [0, 1, 2]
+  # Reliability filtering (fix/tof-reliability)
+  median_window: 5          # rolling median filter window per channel
+  max_spike_mm: 600         # reject readings jumping > this from rolling median
+  stale_timeout_sec: 2.0    # invalidate channel after this long with no good reads
+  consec_agree: 2           # require N consecutive matching raw states before flip
   approach:
     enabled: true
     head_turn_deg: 30.0

@@ -1886,6 +1886,10 @@ tof_tracker = TofPresenceTracker(
     absent_min_mm=TOF_ABSENT_MIN_MM,
     debounce_present_sec=TOF_DEBOUNCE_PRESENT_SEC,
     debounce_absent_sec=TOF_DEBOUNCE_ABSENT_SEC,
+    median_window=_tof.median_window,
+    max_spike_mm=_tof.max_spike_mm,
+    stale_timeout_sec=_tof.stale_timeout_sec,
+    consec_agree=_tof.consec_agree,
 )
 
 

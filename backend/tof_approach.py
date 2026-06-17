@@ -1,4 +1,10 @@
-"""One-shot ToF approach: latch sector, orient once, confirm with camera, cooldown."""
+"""One-shot ToF approach: latch sector, orient once, confirm with camera, cooldown.
+
+Reliability fixes (fix/tof-reliability):
+  - Confirmed rising edge: presence must persist for confirm_rise_sec before triggering
+  - Minimum distance filter: only trigger if reading is below far-range threshold
+  - Sector-change cooldown: prevents rapid left/right bouncing from noisy readings
+"""
 
 from __future__ import annotations
 
@@ -74,6 +80,79 @@ def detect_rising_edge(
     return None
 
 
+class ConfirmedRisingEdge:
+    """Require presence to persist for a minimum duration before signaling.
+
+    Prevents false approach triggers from transient ToF noise that sneaks past
+    the presence tracker's debouncing.
+    """
+
+    def __init__(self, confirm_sec: float = 0.4, sector_cooldown_sec: float = 1.5):
+        self._confirm_sec = confirm_sec
+        self._sector_cooldown_sec = sector_cooldown_sec
+        self._pending_sector: str | None = None
+        self._pending_since: float = 0.0
+        self._last_trigger_sector: str | None = None
+        self._last_trigger_ts: float = 0.0
+
+    def check(
+        self,
+        presence: TofPresence,
+        prev: TofPresence,
+        snapshot: TofSnapshot,
+        *,
+        left_right_only: bool,
+        present_max_mm: float,
+        now: float,
+    ) -> str | None:
+        """Return confirmed sector, or None if no confirmed rising edge."""
+        raw_edge = detect_rising_edge(
+            presence, prev, left_right_only=left_right_only
+        )
+
+        if raw_edge is not None:
+            # New sector just went present — start confirmation timer
+            if self._pending_sector != raw_edge:
+                self._pending_sector = raw_edge
+                self._pending_since = now
+            # Check if distance is reasonable (not a far-field noise trigger)
+            sector_mm = {
+                "left": snapshot.left_mm,
+                "center": snapshot.center_mm,
+                "right": snapshot.right_mm,
+            }.get(raw_edge, -1)
+            if sector_mm < 0 or sector_mm > present_max_mm:
+                # Distance too far or invalid — don't confirm
+                return None
+
+        if self._pending_sector is not None:
+            # Check if the pending sector is still present
+            still_present = getattr(presence, self._pending_sector, False)
+            if not still_present:
+                # Lost presence during confirmation window — cancel
+                self._pending_sector = None
+                return None
+
+            # Check confirmation time
+            if now - self._pending_since >= self._confirm_sec:
+                sector = self._pending_sector
+                self._pending_sector = None
+
+                # Sector-change cooldown: prevent rapid bouncing
+                if (
+                    self._last_trigger_sector is not None
+                    and sector != self._last_trigger_sector
+                    and now - self._last_trigger_ts < self._sector_cooldown_sec
+                ):
+                    return None
+
+                self._last_trigger_sector = sector
+                self._last_trigger_ts = now
+                return sector
+
+        return None
+
+
 class TofApproachController:
     """
     Latch-on-edge approach controller.
@@ -133,6 +212,10 @@ class TofApproachController:
         self._presence_synced = False
         self._started_ts: float | None = None
         self._boot_orient_done = False
+        self._confirmed_edge = ConfirmedRisingEdge(
+            confirm_sec=0.4,
+            sector_cooldown_sec=getattr(self, 'lockout_sec', 10.0) * 0.15,
+        )
 
     def sync_presence(self, presence: TofPresence, now: float) -> None:
         """Seed previous presence from first live reading (avoids fake rising edges)."""
@@ -234,10 +317,13 @@ class TofApproachController:
 
         rising = None
         if armed:
-            rising = detect_rising_edge(
+            rising = self._confirmed_edge.check(
                 presence,
                 self._prev_presence,
+                snapshot,
                 left_right_only=self.left_right_only,
+                present_max_mm=self.present_max_mm,
+                now=now,
             )
         self._prev_presence = presence
 
