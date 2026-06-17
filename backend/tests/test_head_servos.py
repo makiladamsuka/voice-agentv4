@@ -60,7 +60,7 @@ TILT_MOTION = HeadMotionParams(
 )
 
 # Base tap (M/N = one small encoder move per press)
-BASE_TAP_DEG = 3.0
+BASE_TAP_DEG = 1.5
 BASE_TAP_DEBOUNCE_SEC = 0.22
 
 # Spring return to center (home / C key)

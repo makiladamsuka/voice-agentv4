@@ -191,6 +191,16 @@ def assert_detection_aspect_matches(
             )
 
 
+def _yunet_best_face_score(faces: np.ndarray) -> float:
+    """Largest confidence-weighted face box (YuNet col 14 = score)."""
+    best = 0.0
+    for face in faces:
+        area = float(face[2]) * float(face[3])
+        conf = float(face[14]) if len(face) > 14 else 1.0
+        best = max(best, area * conf)
+    return best
+
+
 def detect_faces_yunet_fast(
     detector: Any,
     oriented_frame: np.ndarray,
@@ -234,10 +244,9 @@ def detect_faces_yunet(
             if result[1] is None:
                 continue
             faces = result[1]
-            largest = max(faces, key=lambda f: float(f[2]) * float(f[3]))
-            area = float(largest[2]) * float(largest[3])
-            if area > best_area:
-                best_area = area
+            score = _yunet_best_face_score(faces)
+            if score > best_area:
+                best_area = score
                 best_faces = faces
                 best_mode = mode
 

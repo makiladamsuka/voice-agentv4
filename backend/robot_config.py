@@ -210,6 +210,16 @@ class FaceTrackingConfig:
     wander_base_follow_min_drift_vel: float = 2.5
     wander_base_follow_cooldown_sec: float = 10.0
     wander_base_follow_eval_sec: float = 2.2
+    face_base_alive_enabled: bool = True
+    face_base_alive_deg: float = 3.5
+    face_base_alive_max_deg: float = 5.0
+    face_base_alive_min_sec: float = 14.0
+    face_base_alive_max_sec: float = 24.0
+    face_base_edge_norm: float = 0.48
+    face_base_edge_nudge_deg: float = 4.0
+    face_base_edge_pan_edge_deg: float = 8.0
+    face_base_cooldown_sec: float = 4.5
+    face_base_head_comp_alpha: float = 0.95
     sad_return_sec: float = 10.0
     sad_nod_tilt_deg: float = 10.0
     sad_nod_count: float = 2.0
@@ -294,7 +304,7 @@ class GazeConfig:
 class ServoConfig:
     enabled: bool = True
     backend: str = "arduino"
-    arduino_port: str = ""
+    arduino_port: str = "/dev/ttyUSB0"
     arduino_baud: int = 115200
     pan_ch: int = 4
     tilt_ch: int = 5
@@ -347,7 +357,9 @@ class BaseConfig:
     counts_per_degree: float = 1.0
     max_relative_deg: float = 180.0
     max_deg_from_zero: float = 20.0
-    move_timeout_sec: float = 15.0
+    max_nudge_deg: float = 5.0
+    move_timeout_sec: float = 8.0
+    error_backoff_sec: float = 45.0
 
 
 @dataclass
@@ -358,7 +370,7 @@ class TofApproachConfig:
     boot_pan_step_deg: float = 30.0
     arrival_deg: float = 3.0
     use_base: bool = True
-    base_nudge_deg: float = 12.0
+    base_nudge_deg: float = 5.0
     max_base_nudges_per_event: int = 1
     confirm_delay_sec: float = 0.6
     lockout_sec: float = 10.0

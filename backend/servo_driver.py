@@ -20,6 +20,11 @@ class ServoDriver(Protocol):
 class ArduinoServoDriver:
     def __init__(self, link: ArduinoServoLink):
         self._link = link
+        self.base_motion_allowed = True
+
+    @property
+    def serial_connected(self) -> bool:
+        return self._link.connected
 
     def write_angles(self, pan: float, tilt: float, *, force: bool = False) -> bool:
         return self._link.write_angles(pan, tilt, force=force)
@@ -46,6 +51,8 @@ class ArduinoServoDriver:
         )
 
     def write_base_relative(self, deg: float, *, wait: bool = True) -> bool:
+        if not self.base_motion_allowed:
+            return False
         return self._link.write_base_relative(deg, wait=wait)
 
     def write_base_relative_clamped(
@@ -53,8 +60,14 @@ class ArduinoServoDriver:
         deg: float,
         *,
         max_from_zero: float,
+        max_nudge_deg: float | None = None,
         wait: bool = True,
     ) -> bool:
+        if not self.base_motion_allowed:
+            return False
+        if max_nudge_deg is not None and max_nudge_deg > 0:
+            cap = float(max_nudge_deg)
+            deg = max(-cap, min(cap, deg))
         st = self.query_base_status()
         base_now = st.degrees if st is not None else 0.0
         if st is not None and st.busy:
@@ -171,16 +184,27 @@ def _create_servo_driver_once(cfg: RobotConfig) -> Optional[ServoDriver]:
 
     if backend == "arduino":
         link = ArduinoServoLink(port=sv.arduino_port, baud=sv.arduino_baud)
+        link.base_move_timeout_sec = float(cfg.base.move_timeout_sec)
         if not link.connect():
             return None
         try:
             from base_motor_utils import apply_config_cpd_to_nano
 
-            apply_config_cpd_to_nano(link)
+            cpd_ok = apply_config_cpd_to_nano(link)
         except Exception as e:
             print(f"Warning: could not apply base CPD to ESP32: {e}")
+            cpd_ok = False
+        driver = ArduinoServoDriver(link)
+        if cfg.base.enabled:
+            calibrated = link.is_calibrated()
+            driver.base_motion_allowed = bool(cpd_ok and calibrated)
+            if not driver.base_motion_allowed:
+                print(
+                    "Base motor disabled until CPD is calibrated — head servos still active.\n"
+                    "  Run: python tests/test_base_motor.py --calibrate-manual --degrees 90 --write-config"
+                )
         print(f"Head servos: {format_head_servo_map()}")
-        return ArduinoServoDriver(link)
+        return driver
 
     if backend == "servokit":
         try:

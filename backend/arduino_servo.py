@@ -82,6 +82,15 @@ def _is_plausible_serial_line(line: str) -> bool:
 
 def resolve_port(port: str) -> list[str]:
     if port:
+        if os.path.exists(port):
+            return [port]
+        fallbacks = [p for p in DEFAULT_PORTS if os.path.exists(p)]
+        print(fallbacks)
+        if fallbacks:
+            print(
+                f"Configured serial port {port} not found; using {fallbacks[0]} instead"
+            )
+            return fallbacks
         return [port]
     return [p for p in DEFAULT_PORTS if os.path.exists(p)]
 
@@ -178,7 +187,8 @@ class ArduinoServoLink:
             try:
                 self._ser.write(b"F\n")
                 self._ser.flush()
-                probe = self._read_tof_line(2.5)
+                # First F can block while VL53 sensors init on the ESP32.
+                probe = self._read_tof_line(10.0)
             except serial.SerialException:
                 probe = None
             if probe is not None:
@@ -445,11 +455,22 @@ class ArduinoServoLink:
             return None
         if line.startswith("ERR B"):
             print(line)
+            self._ensure_base_stopped()
             return None
         match = _BASE_ACK_RE.match(line)
         if match:
             return float(match.group(1))
         return None
+
+    def _ensure_base_stopped(self) -> None:
+        """Send stop after firmware ERR B (belt-and-suspenders)."""
+        if not self._connected or self._ser is None:
+            return
+        try:
+            self._ser.write(b"X\n")
+            self._ser.flush()
+        except Exception:
+            pass
 
     def send_line(
         self,
@@ -487,6 +508,8 @@ class ArduinoServoLink:
                 self._last_ack = self.read_ack()
             if wait_base:
                 self._last_base_ack = self.read_base_ack()
+                if self._last_base_ack is None:
+                    return False
             elif drain_after and not wait_servo:
                 self._drain_rx()
             return True

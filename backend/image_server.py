@@ -8,6 +8,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 
+class _ReuseHTTPServer(HTTPServer):
+    allow_reuse_address = True
+
+
 class ImageServer:
     """Serve static media from backend/assets for the v2 frontend ImageDisplay."""
 
@@ -111,10 +115,13 @@ class ImageServer:
                 pass
 
         try:
-            self.server = HTTPServer((self.host, self.port), AssetHandler)
+            self.server = _ReuseHTTPServer((self.host, self.port), AssetHandler)
         except OSError as e:
-            if e.errno == 98:
-                print(f"Port {self.port} already in use (media server)")
+            if e.errno in (98, 48):
+                print(
+                    f"Port {self.port} already in use (media server) — "
+                    "reusing existing instance or stop stale voice_agent.py"
+                )
                 return
             raise
 
