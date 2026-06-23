@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,8 +25,8 @@ BOTANGO_TRACK_MAP: dict[str, str] = {
 
 HEAD_PAN_DEG = (40.0, 130.0)
 HEAD_TILT_DEG = (80.0, 130.0)
-HEAD_PAN_HOME_DEG = (HEAD_PAN_DEG[0] + HEAD_PAN_DEG[1]) * 0.5
-HEAD_TILT_HOME_DEG = (HEAD_TILT_DEG[0] + HEAD_TILT_DEG[1]) * 0.5
+HEAD_PAN_HOME_DEG = 85.0
+HEAD_TILT_HOME_DEG = 115.0
 
 # PCA channel, label — all 6 servos
 SERVO_STOP_SPECS: tuple[tuple[str, str, str], ...] = (
@@ -38,11 +39,32 @@ SERVO_STOP_SPECS: tuple[tuple[str, str, str], ...] = (
 )
 
 DEFAULT_ARM_NEUTRALS: dict[str, float] = {
-    "arm_0": 0.0,
-    "arm_1": 180.0,
-    "arm_2": 90.0,
-    "arm_3": 90.0,
+    "arm_0": 47.0,
+    "arm_1": 65.0,
+    "arm_2": 64.0,
+    "arm_3": 87.0,
 }
+
+ARM_DEG_RANGE: dict[str, tuple[float, float]] = {
+    "arm_0": (47.0, 124.0),
+    "arm_1": (6.0, 65.0),
+    "arm_2": (44.0, 78.0),
+    "arm_3": (70.0, 102.0),
+}
+
+
+def resolve_arm_neutrals() -> dict[str, float]:
+    """Arm home degrees; start_robot.py can override via ROBOT_ARM_*_HOME env."""
+    out = dict(DEFAULT_ARM_NEUTRALS)
+    for arm in out:
+        raw = os.environ.get(f"ROBOT_{arm.upper()}_HOME")
+        if raw is None:
+            continue
+        try:
+            out[arm] = float(raw)
+        except ValueError:
+            pass
+    return out
 
 
 def _lerp(a: float, b: float, t: float) -> float:
@@ -280,7 +302,7 @@ def load_botango_commands_file(path: str | Path) -> list[AnimationClip]:
 
 
 def servo_stop_pose(arm_neutrals: dict[str, float] | None = None) -> dict[str, float]:
-    arms = dict(DEFAULT_ARM_NEUTRALS)
+    arms = resolve_arm_neutrals()
     if arm_neutrals:
         arms.update(arm_neutrals)
     return {

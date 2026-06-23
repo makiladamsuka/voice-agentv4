@@ -24,11 +24,13 @@ from _bootstrap import BACKEND_ROOT
 from animation_player import AnimationPlayer
 from arduino_servo import ArduinoServoLink
 from botango_loader import (
+    ARM_DEG_RANGE,
     DEFAULT_ARM_NEUTRALS,
     _parse_setup,
     format_servo_stop_pose,
     load_botango_commands_file,
     neutral_arm_degrees,
+    resolve_arm_neutrals,
     servo_stop_pose,
 )
 
@@ -56,7 +58,7 @@ def blend_track(base: float, sample_value: float, mode: str, weight: float) -> f
 
 
 def load_arm_neutrals() -> dict[str, float]:
-    defaults = dict(DEFAULT_ARM_NEUTRALS)
+    defaults = resolve_arm_neutrals()
     if not BOTANGO_FILE.exists():
         return defaults
     with BOTANGO_FILE.open(encoding="utf-8") as f:
@@ -80,10 +82,10 @@ def send_frame(
     frame = {
         "P": pan,
         "T": tilt,
-        "A0=": clamp(arms.get("arm_0", 0.0), 0.0, 180.0),
-        "A1=": clamp(arms.get("arm_1", 180.0), 0.0, 180.0),
-        "A2=": clamp(arms.get("arm_2", 90.0), 0.0, 180.0),
-        "A3=": clamp(arms.get("arm_3", 90.0), 0.0, 180.0),
+        "A0=": clamp(arms.get("arm_0", 47.0), *ARM_DEG_RANGE["arm_0"]),
+        "A1=": clamp(arms.get("arm_1", 65.0), *ARM_DEG_RANGE["arm_1"]),
+        "A2=": clamp(arms.get("arm_2", 64.0), *ARM_DEG_RANGE["arm_2"]),
+        "A3=": clamp(arms.get("arm_3", 87.0), *ARM_DEG_RANGE["arm_3"]),
     }
     link.write_servo_frame(frame)
 

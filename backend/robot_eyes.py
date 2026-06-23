@@ -43,11 +43,13 @@ from tof_presence import TofPresenceTracker, TofSnapshot, TofPresence, sanitize_
 from tof_approach import TofApproachController
 from animation_player import AnimationPlayer
 from botango_loader import (
+    ARM_DEG_RANGE,
     DEFAULT_ARM_NEUTRALS,
     _parse_setup,
     format_servo_stop_pose,
     load_botango_commands_file,
     neutral_arm_degrees,
+    resolve_arm_neutrals,
     servo_stop_pose,
 )
 from person_detector import PersonDetector
@@ -1917,7 +1919,7 @@ servo_aversion_tilt_offset = 0.0
 
 animation_lock = threading.Lock()
 animation_player = AnimationPlayer()
-neutral_arm_targets: dict[str, float] = dict(DEFAULT_ARM_NEUTRALS)
+neutral_arm_targets: dict[str, float] = resolve_arm_neutrals()
 animation_arm_targets: dict[str, float] = dict(neutral_arm_targets)
 arm_current_smoothed: dict[str, float] = dict(neutral_arm_targets)
 _last_servo_frame_ts = 0.0
@@ -2958,17 +2960,29 @@ def servo_worker():
         if send_frame:
             try:
                 frame_tokens: dict[str, float] = {"P": pan_current, "T": tilt_current}
+                lo0, hi0 = ARM_DEG_RANGE.get("arm_0", (0.0, 180.0))
+                lo1, hi1 = ARM_DEG_RANGE.get("arm_1", (0.0, 180.0))
+                lo2, hi2 = ARM_DEG_RANGE.get("arm_2", (0.0, 180.0))
+                lo3, hi3 = ARM_DEG_RANGE.get("arm_3", (0.0, 180.0))
                 frame_tokens["A0="] = clamp(
-                    arm_current_smoothed.get("arm_0", neutral_arm_targets.get("arm_0", 0.0)), 0.0, 180.0
+                    arm_current_smoothed.get("arm_0", neutral_arm_targets.get("arm_0", lo0)),
+                    lo0,
+                    hi0,
                 )
                 frame_tokens["A1="] = clamp(
-                    arm_current_smoothed.get("arm_1", neutral_arm_targets.get("arm_1", 180.0)), 0.0, 180.0
+                    arm_current_smoothed.get("arm_1", neutral_arm_targets.get("arm_1", lo1)),
+                    lo1,
+                    hi1,
                 )
                 frame_tokens["A2="] = clamp(
-                    arm_current_smoothed.get("arm_2", neutral_arm_targets.get("arm_2", 90.0)), 0.0, 180.0
+                    arm_current_smoothed.get("arm_2", neutral_arm_targets.get("arm_2", lo2)),
+                    lo2,
+                    hi2,
                 )
                 frame_tokens["A3="] = clamp(
-                    arm_current_smoothed.get("arm_3", neutral_arm_targets.get("arm_3", 90.0)), 0.0, 180.0
+                    arm_current_smoothed.get("arm_3", neutral_arm_targets.get("arm_3", lo3)),
+                    lo3,
+                    hi3,
                 )
                 if hasattr(servo_driver, "write_servo_frame"):
                     servo_driver.write_servo_frame(frame_tokens)
@@ -3586,21 +3600,47 @@ def vision_worker():
 
 
 def _start_servo_hardware(driver) -> None:
-    """Center head, start servo worker (+ ToF when enabled)."""
+    """Center head, home arms, start servo worker (+ ToF when enabled)."""
     global servo_driver, servo_running, servo_thread
+    global arm_current_smoothed, animation_arm_targets
 
     if driver is None or servo_running:
         return
     servo_driver = driver
     pan_c, tilt_c = head_center_angles()
+    arms = dict(neutral_arm_targets)
+    link = getattr(driver, "_link", None)
     try:
-        servo_driver.write_angles(pan_c, tilt_c, force=True)
+        if link is not None and getattr(link, "has_arm_firmware", lambda: False)():
+            link.write_angles_and_arms(
+                pan_c,
+                tilt_c,
+                arms["arm_0"],
+                arms["arm_1"],
+                arms["arm_2"],
+                arms["arm_3"],
+                force=True,
+            )
+            arm_current_smoothed.update(arms)
+            animation_arm_targets.update(arms)
+            time.sleep(0.4)
+            print(
+                f"Head + arms at home (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
+                f"A0={arms['arm_0']:.1f} A1={arms['arm_1']:.1f} "
+                f"A2={arms['arm_2']:.1f} A3={arms['arm_3']:.1f} — face tracking enabled"
+            )
+        else:
+            driver.write_angles(pan_c, tilt_c, force=True)
+            print(
+                f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
+                f"— face tracking enabled"
+            )
     except TypeError:
-        servo_driver.write_angles(pan_c, tilt_c)
-    print(
-        f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
-        f"— face tracking enabled"
-    )
+        driver.write_angles(pan_c, tilt_c)
+        print(
+            f"Head servos centered (ESP32): P={pan_c:.1f} T={tilt_c:.1f} "
+            f"— face tracking enabled"
+        )
     servo_running = True
     servo_thread = threading.Thread(target=servo_worker, daemon=True)
     servo_thread.start()
